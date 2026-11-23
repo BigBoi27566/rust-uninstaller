@@ -16,25 +16,26 @@ use std::sync::mpsc::{channel, Receiver, Sender};
 use std::thread;
 use std::time::Duration;
 
-/// Render an inline action tooltip with smooth fade-in/out transition under the target element
+/// Render an action tooltip with smooth fade-in/out transition under the target element
 fn show_fade_tooltip(ui: &mut Ui, response: &Response, text: &str) {
     let hovered = response.hovered();
     let alpha = ui.ctx().animate_bool(response.id.with("fade_tip"), hovered);
     if alpha > 0.005 {
-        let painter = ui.painter();
+        // Use debug_painter() on ctx to render into Foreground layer above all panels and clip rects
+        let painter = ui.ctx().debug_painter();
         let font_id = egui::TextStyle::Small.resolve(ui.style());
-        let padding = egui::vec2(6.0, 3.0);
-        let galley = painter.layout_no_wrap(text.to_owned(), font_id, Color32::from_white_alpha((230.0 * alpha) as u8));
+        let padding = egui::vec2(7.0, 4.0);
+        let galley = painter.layout_no_wrap(text.to_owned(), font_id, Color32::from_white_alpha((240.0 * alpha) as u8));
         let tip_size = galley.size() + padding * 2.0;
         let tip_rect = egui::Rect::from_min_size(
             egui::pos2(response.rect.left(), response.rect.bottom() + 4.0),
             tip_size,
         );
 
-        // Draw smooth rounded tooltip backdrop & border
-        painter.rect_filled(tip_rect, 4.0, Color32::from_rgba_premultiplied(20, 20, 20, (235.0 * alpha) as u8));
-        painter.rect_stroke(tip_rect, 4.0, egui::Stroke::new(1.0_f32, Color32::from_rgba_premultiplied(90, 90, 90, (200.0 * alpha) as u8)));
-        painter.galley(tip_rect.min + padding, galley, Color32::from_white_alpha((230.0 * alpha) as u8));
+        // Draw floating rounded tooltip above other UI layers
+        painter.rect_filled(tip_rect, 4.0, Color32::from_rgba_premultiplied(24, 24, 24, (245.0 * alpha) as u8));
+        painter.rect_stroke(tip_rect, 4.0, egui::Stroke::new(1.0_f32, Color32::from_rgba_premultiplied(100, 100, 100, (220.0 * alpha) as u8)));
+        painter.galley(tip_rect.min + padding, galley, Color32::from_white_alpha((240.0 * alpha) as u8));
     }
 }
 
