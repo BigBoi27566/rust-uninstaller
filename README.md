@@ -80,6 +80,24 @@ RustUninstaller/
 
 ---
 
+## 💡 Acknowledgements & Heritage
+
+RustUninstaller was inspired by and originated as a native Rust reimplementation of the legendary [Bulk Crap Uninstaller (BCU)](https://github.com/Klocman/Bulk-Crap-Uninstaller) by [Marcin Szeniak (Klocman)](https://github.com/Klocman). 
+
+We would like to express our deepest gratitude to Marcin Szeniak and the BCU contributors for creating the gold standard uninstaller for Windows. RustUninstaller aims to carry forward that legacy into a lightweight, instant-startup, pure native Rust ecosystem.
+
+---
+
+## 🤝 Community & Feedback
+
+We encourage everyone to **download, try it out, and share feedback!** 
+
+Your ideas and real-world usage help make RustUninstaller even better:
+- **Found a bug or an app that uninstalls unexpectedly?** Open an [Issue](https://github.com/BigBoi27566/rust-uninstaller/issues).
+- **Want to add a feature or improve performance?** Pull Requests are warmly welcomed! Check out open [Pull Requests](https://github.com/BigBoi27566/rust-uninstaller/pulls) or start a discussion.
+
+---
+
 ## 📄 License
 
 Licensed under the [Apache License, Version 2.0](LICENSE).
