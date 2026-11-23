@@ -6,7 +6,7 @@ use bcu_core::recycle::clean_junk_items;
 use bcu_core::registry::scan_registry_uninstallers;
 use bcu_core::registry_deep::{clean_registry_remnants, scan_deep_registry, RegistryRemnant};
 use bcu_core::store::scan_store_apps;
-use eframe::egui::{self, Color32};
+use eframe::egui::{self, Color32, Response, Ui};
 use egui_extras::{Column, TableBuilder};
 use std::collections::HashSet;
 use std::env;
@@ -15,6 +15,28 @@ use std::process::{Child, Command};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::thread;
 use std::time::Duration;
+
+/// Render an inline action tooltip with smooth fade-in/out transition under the target element
+fn show_fade_tooltip(ui: &mut Ui, response: &Response, text: &str) {
+    let hovered = response.hovered();
+    let alpha = ui.ctx().animate_bool(response.id.with("fade_tip"), hovered);
+    if alpha > 0.005 {
+        let painter = ui.painter();
+        let font_id = egui::TextStyle::Small.resolve(ui.style());
+        let padding = egui::vec2(6.0, 3.0);
+        let galley = painter.layout_no_wrap(text.to_owned(), font_id, Color32::from_white_alpha((230.0 * alpha) as u8));
+        let tip_size = galley.size() + padding * 2.0;
+        let tip_rect = egui::Rect::from_min_size(
+            egui::pos2(response.rect.left(), response.rect.bottom() + 4.0),
+            tip_size,
+        );
+
+        // Draw smooth rounded tooltip backdrop & border
+        painter.rect_filled(tip_rect, 4.0, Color32::from_rgba_premultiplied(20, 20, 20, (235.0 * alpha) as u8));
+        painter.rect_stroke(tip_rect, 4.0, egui::Stroke::new(1.0_f32, Color32::from_rgba_premultiplied(90, 90, 90, (200.0 * alpha) as u8)));
+        painter.galley(tip_rect.min + padding, galley, Color32::from_white_alpha((230.0 * alpha) as u8));
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SortOption {
@@ -279,29 +301,38 @@ impl eframe::App for BcuApp {
 
                 ui.separator();
 
-                if ui.checkbox(&mut self.include_store, "Store Apps").changed() {
+                let store_cb = ui.checkbox(&mut self.include_store, "Store Apps");
+                if store_cb.changed() {
                     self.start_scan();
                 }
+                show_fade_tooltip(ui, &store_cb, "Include Universal Windows Platform (UWP) apps");
 
                 // Opt-in Quiet Automation Helper
-                ui.checkbox(&mut self.auto_click_helper, "🤖 Auto-Click");
+                let auto_cb = ui.checkbox(&mut self.auto_click_helper, "🤖 Auto-Click");
+                show_fade_tooltip(ui, &auto_cb, "Automatically confirm uninstaller dialogues");
 
                 ui.separator();
 
-                if ui.button("🔄 Refresh").clicked() {
+                let refresh_btn = ui.button("🔄 Refresh");
+                if refresh_btn.clicked() {
                     self.start_scan();
                 }
+                show_fade_tooltip(ui, &refresh_btn, "Rescan registry and installed applications");
 
-                if ui.button("📄 Export CSV").clicked() {
+                let export_btn = ui.button("📄 Export CSV");
+                if export_btn.clicked() {
                     let csv = export_to_csv(&self.apps);
                     let _ = fs::write("installed_apps.csv", csv);
                     self.status_text = "Exported list to 'installed_apps.csv'".into();
                 }
+                show_fade_tooltip(ui, &export_btn, "Save application inventory to CSV spreadsheet");
 
                 let checked_count = self.checked_indices.len();
                 if checked_count > 0 {
                     ui.separator();
-                    if ui.button(format!("⚡ Uninstall Selected ({})", checked_count)).clicked() {
+                    let uninstall_btn = ui.button(format!("⚡ Uninstall Selected ({})", checked_count));
+                    show_fade_tooltip(ui, &uninstall_btn, "Launch silent uninstaller for checked programs");
+                    if uninstall_btn.clicked() {
                         let auto_click = self.auto_click_helper;
                         let mut launched = 0;
                         let mut errors = Vec::new();
@@ -383,7 +414,9 @@ impl eframe::App for BcuApp {
                         ui.separator();
 
                         if let Some(ref quiet) = app.quiet_uninstall_string {
-                            if ui.button("⚡ Run Quiet Uninstall").clicked() {
+                            let quiet_btn = ui.button("⚡ Run Quiet Uninstall");
+                            show_fade_tooltip(ui, &quiet_btn, "Run vendor uninstaller in silent/unattended mode");
+                            if quiet_btn.clicked() {
                                 let parts: Vec<&str> = quiet.split_whitespace().collect();
                                 if !parts.is_empty() {
                                     if let Ok(child) = Command::new(parts[0]).args(&parts[1..]).spawn() {
@@ -401,14 +434,18 @@ impl eframe::App for BcuApp {
                             }
                         }
 
-                        if ui.button("🧹 Scan Leftover Junk").clicked() {
+                        let junk_btn = ui.button("🧹 Scan Leftover Junk");
+                        show_fade_tooltip(ui, &junk_btn, "Detect orphaned folders and files in ProgramFiles/AppData");
+                        if junk_btn.clicked() {
                             let name = app.display_name.clone();
                             let dir = app.install_location.clone();
                             self.start_junk_scan(name, dir);
                         }
 
                         if !self.junk_items.is_empty() {
-                            if ui.button("🗑️ Send Safe Junk to Recycle Bin").clicked() {
+                            let recycle_btn = ui.button("🗑️ Send Safe Junk to Recycle Bin");
+                            show_fade_tooltip(ui, &recycle_btn, "Move safe leftover files to Windows Recycle Bin");
+                            if recycle_btn.clicked() {
                                 let (cleaned, errors) = clean_junk_items(&self.junk_items, false);
                                 self.status_text = format!("Recycled {} item(s) to Recycle Bin.", cleaned);
                                 for err in errors {
@@ -418,12 +455,16 @@ impl eframe::App for BcuApp {
                             }
                         }
 
-                        if ui.button("🔍 Scan Deep Registry").clicked() {
+                        let reg_btn = ui.button("🔍 Scan Deep Registry");
+                        show_fade_tooltip(ui, &reg_btn, "Search HKCU/HKLM for leftover keys and values");
+                        if reg_btn.clicked() {
                             self.start_registry_scan(app.clone());
                         }
 
                         if !self.registry_remnants.is_empty() {
-                            if ui.button("🛡️ Create .reg Backup & Clean").clicked() {
+                            let clean_reg_btn = ui.button("🛡️ Create .reg Backup & Clean");
+                            show_fade_tooltip(ui, &clean_reg_btn, "Export rollback backup .reg before cleaning remnants");
+                            if clean_reg_btn.clicked() {
                                 match clean_registry_remnants(&self.registry_remnants, None, &app.id) {
                                     Ok(backup_path) => {
                                         self.status_text = format!(
