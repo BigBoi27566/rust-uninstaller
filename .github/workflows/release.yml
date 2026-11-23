@@ -1,0 +1,42 @@
+﻿name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build release binary
+        run: cargo build --release -p bcu-gui
+
+      - name: Prepare binary artifact
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path dist -Force
+          Copy-Item "target/release/bcu-gui.exe" "dist/rust-uninstaller.exe"
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/rust-uninstaller.exe
+          name: RustUninstaller ${{ github.ref_name }}
+          body: |
+            ### ⚡ RustUninstaller ${{ github.ref_name }}
+            Blazing fast, lightweight, and modern native Windows uninstaller written in pure Rust.
+
+            - **Download:** `rust-uninstaller.exe` (Portable, single executable, zero setup)
+            - **Startup:** Instant (< 15ms)
+            - **Zero Runtime:** No .NET, no WebView2, pure native Win32.
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
