@@ -1,0 +1,10 @@
+[package]
+name = "bcu-cli"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+bcu-core = { path = "../bcu-core" }
+serde_json.workspace = true

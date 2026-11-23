@@ -1,0 +1,16 @@
+[package]
+name = "bcu-ffi"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+bcu-core = { path = "../bcu-core" }
+serde_json.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

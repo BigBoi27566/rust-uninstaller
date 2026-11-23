@@ -1,0 +1,16 @@
+[package]
+name = "bcu-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+rayon.workspace = true
+windows.workspace = true
+winreg.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

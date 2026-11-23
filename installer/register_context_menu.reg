@@ -1,0 +1,9 @@
+Windows Registry Editor Version 5.00
+
+; Register "Find Leftovers with BCU" into Windows Explorer directory context menu
+[HKEY_CLASSES_ROOT\Directory\shell\BCU]
+@="Find Leftovers with BCU"
+"Icon"="\"C:\\Program Files\\Bulk Crap Uninstaller\\bcu-gui.exe\""
+
+[HKEY_CLASSES_ROOT\Directory\shell\BCU\command]
+@="\"C:\\Program Files\\Bulk Crap Uninstaller\\bcu-gui.exe\" --scan-dir \"%1\""

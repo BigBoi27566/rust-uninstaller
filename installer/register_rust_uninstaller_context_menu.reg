@@ -1,0 +1,9 @@
+Windows Registry Editor Version 5.00
+
+; Register "Find Leftovers with RustUninstaller" into Windows Explorer directory context menu
+[HKEY_CLASSES_ROOT\Directory\shell\RustUninstaller]
+@="Find Leftovers with RustUninstaller"
+"Icon"="\"C:\\Program Files\\RustUninstaller\\rust-uninstaller.exe\""
+
+[HKEY_CLASSES_ROOT\Directory\shell\RustUninstaller\command]
+@="\"C:\\Program Files\\RustUninstaller\\rust-uninstaller.exe\" --scan-dir \"%1\""
