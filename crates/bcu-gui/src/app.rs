@@ -1,4 +1,9 @@
 use crate::cleanup_modal::{format_bytes, CleanupAction, CleanupModalState};
+use crate::theme::{
+    self, apply_theme, confidence_badge_colors, draw_monogram_icon, draw_pill,
+    draw_top_progress_bar, kind_badge_colors, quiet_badge_colors, size_bar_ratio,
+};
+use bcu_core::icons::extract_app_icon_rgba;
 use bcu_core::junk::{scan_disk_junk, scan_disk_junk_deep};
 use bcu_core::models::{ApplicationEntry, ConfidenceLevel, JunkItem, UninstallerKind};
 use bcu_core::queue::{TaskStatus, UninstallQueue};
@@ -10,9 +15,12 @@ use bcu_core::registry_deep::{
     scan_deep_registry, RegistryRemnant,
 };
 use bcu_core::store::scan_store_apps;
-use eframe::egui::{self, Color32, Response, Ui};
+use eframe::egui::{
+    self, Color32, ColorImage, Id, Key, Pos2, Rect, Response, RichText, Rounding, Sense, Stroke,
+    TextureHandle, TextureOptions, Ui, Vec2,
+};
 use egui_extras::{Column, TableBuilder};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
@@ -73,6 +81,7 @@ pub enum AppEvent {
         junk: Vec<JunkItem>,
         remnants: Vec<RegistryRemnant>,
     },
+    IconsBatch(Vec<(String, Vec<u8>)>),
     JunkLoaded(Vec<JunkItem>),
     RegistryLoaded(Vec<RegistryRemnant>),
 }
@@ -85,6 +94,10 @@ pub struct BcuApp {
     pub sort_option: SortOption,
     pub apps: Vec<ApplicationEntry>,
     pub cached_indices: Vec<usize>,
+    pub max_filtered_size_bytes: u64,
+    pub total_filtered_bytes: u64,
+    pub checked_total_bytes: u64,
+    pub icon_textures: HashMap<String, TextureHandle>,
     pub selected_index: Option<usize>,
     pub checked_indices: HashSet<usize>,
     pub is_scanning: bool,
@@ -110,6 +123,10 @@ impl Default for BcuApp {
             sort_option: SortOption::NameAsc,
             apps: Vec::new(),
             cached_indices: Vec::new(),
+            max_filtered_size_bytes: 0,
+            total_filtered_bytes: 0,
+            checked_total_bytes: 0,
+            icon_textures: HashMap::new(),
             selected_index: None,
             checked_indices: HashSet::new(),
             is_scanning: false,
@@ -127,7 +144,8 @@ impl Default for BcuApp {
 }
 
 impl BcuApp {
-    pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
+    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        apply_theme(&cc.egui_ctx);
         let mut app = Self::default();
 
         // Check for --scan-dir CLI parameter (Explorer context menu)
@@ -283,13 +301,58 @@ impl BcuApp {
 
     pub fn recompute_filtered_indices(&mut self) {
         self.cached_indices = self.filtered_indices();
+        let mut max_size = 0u64;
+        let mut total = 0u64;
+        for &idx in &self.cached_indices {
+            if let Some(size) = self.apps.get(idx).and_then(|a| a.estimated_size_bytes) {
+                max_size = max_size.max(size);
+                total = total.saturating_add(size);
+            }
+        }
+        self.max_filtered_size_bytes = max_size;
+        self.total_filtered_bytes = total;
+        self.recompute_checked_bytes();
+    }
+
+    pub fn recompute_checked_bytes(&mut self) {
+        self.checked_total_bytes = self
+            .checked_indices
+            .iter()
+            .filter_map(|&idx| self.apps.get(idx).and_then(|a| a.estimated_size_bytes))
+            .sum();
     }
 
     pub fn clear_selection_and_details(&mut self) {
         self.selected_index = None;
         self.checked_indices.clear();
+        self.checked_total_bytes = 0;
         self.junk_items.clear();
         self.registry_remnants.clear();
+    }
+
+    fn start_icon_loader(&self, apps: Vec<ApplicationEntry>) {
+        let tx = self.sender.clone();
+        let missing: Vec<ApplicationEntry> = apps
+            .into_iter()
+            .filter(|a| !self.icon_textures.contains_key(&a.id))
+            .collect();
+        if missing.is_empty() {
+            return;
+        }
+        thread::spawn(move || {
+            let mut batch = Vec::with_capacity(16);
+            for app in missing {
+                if let Some(rgba) = extract_app_icon_rgba(&app) {
+                    batch.push((app.id, rgba));
+                    if batch.len() >= 16 {
+                        let _ = tx.send(AppEvent::IconsBatch(std::mem::take(&mut batch)));
+                    }
+                }
+            }
+            if !batch.is_empty() {
+                let _ = tx.send(AppEvent::IconsBatch(batch));
+            }
+        });
     }
 
     pub fn request_uninstall_targets(&mut self, targets: Vec<ApplicationEntry>) {
@@ -304,10 +367,11 @@ impl BcuApp {
         }
     }
 
-    fn check_events(&mut self) {
+    fn check_events(&mut self, ctx: &egui::Context) {
         while let Ok(event) = self.receiver.try_recv() {
             match event {
                 AppEvent::AppsLoaded(list) => {
+                    self.start_icon_loader(list.clone());
                     self.apps = list;
                     self.is_scanning = false;
                     self.recompute_filtered_indices();
@@ -318,6 +382,7 @@ impl BcuApp {
                     status,
                     removed_targets,
                 } => {
+                    self.start_icon_loader(apps.clone());
                     self.apps = apps;
                     self.is_scanning = false;
                     self.clear_selection_and_details();
@@ -325,6 +390,15 @@ impl BcuApp {
                     self.status_text = status;
                     if !removed_targets.is_empty() {
                         self.start_post_uninstall_scan(removed_targets);
+                    }
+                }
+                AppEvent::IconsBatch(items) => {
+                    for (id, rgba) in items {
+                        if rgba.len() == 16 * 16 * 4 {
+                            let img = ColorImage::from_rgba_unmultiplied([16, 16], &rgba);
+                            let tex = ctx.load_texture(format!("icon_{}", id), img, TextureOptions::LINEAR);
+                            self.icon_textures.insert(id, tex);
+                        }
                     }
                 }
                 AppEvent::PostUninstallCleanupReady {
@@ -352,35 +426,78 @@ impl BcuApp {
 
 impl eframe::App for BcuApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.check_events();
+        self.check_events(ctx);
+
+        let search_id = Id::new("bcu_search_input");
+        let (ctrl_f, f5, esc) = ctx.input(|i| {
+            (
+                i.modifiers.ctrl && i.key_pressed(Key::F),
+                i.key_pressed(Key::F5),
+                i.key_pressed(Key::Escape),
+            )
+        });
+        if ctrl_f {
+            ctx.memory_mut(|m| m.request_focus(search_id));
+        }
+        if f5 && !self.is_scanning {
+            self.start_scan();
+        }
+        if esc {
+            if self.cleanup_modal.is_some() {
+                self.cleanup_modal = None;
+                self.status_text = "Skipped post-uninstall leftover cleanup.".into();
+            } else if self.pending_confirm.is_some() {
+                self.pending_confirm = None;
+                self.status_text = "Action cancelled.".into();
+            } else if self.selected_index.is_some() {
+                self.selected_index = None;
+                self.junk_items.clear();
+                self.registry_remnants.clear();
+            }
+        }
 
         // Top Toolbar
-        egui::TopBottomPanel::top("top_toolbar").show(ctx, |ui| {
-            ui.add_space(4.0);
+        let top_panel = egui::TopBottomPanel::top("top_toolbar").show(ctx, |ui| {
+            ui.add_space(6.0);
 
-            // Row 1: Header title on the left, live status text on the right
+            // Row 1: Header title on the left, footprint chip & status on the right
             ui.horizontal(|ui| {
-                ui.heading("⚡ RustUninstaller");
+                let (dot_rect, _) = ui.allocate_exact_size(Vec2::splat(10.0), egui::Sense::hover());
+                ui.painter().circle_filled(dot_rect.center(), 4.5, theme::ACCENT);
+                ui.label(RichText::new("RustUninstaller").size(18.0).strong());
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if self.is_scanning {
                         ui.spinner();
                     }
-                    ui.colored_label(Color32::from_rgb(170, 205, 230), &self.status_text);
+                    ui.colored_label(theme::TEXT_MUTED, &self.status_text);
+                    if !self.cached_indices.is_empty() {
+                        draw_pill(
+                            ui,
+                            &format!(
+                                "{} apps · {}",
+                                self.cached_indices.len(),
+                                format_bytes(self.total_filtered_bytes)
+                            ),
+                            theme::BG_ELEVATED,
+                            theme::TEXT_PRIMARY,
+                        );
+                    }
                 });
             });
 
-            ui.add_space(2.0);
+            ui.add_space(4.0);
             ui.separator();
-            ui.add_space(2.0);
+            ui.add_space(4.0);
 
             // Row 2: Search, sort options, filters and action buttons (wrapped so nothing clips at min width)
             ui.horizontal_wrapped(|ui| {
-                ui.label("Search:");
+                ui.colored_label(theme::TEXT_MUTED, "Search:");
                 let search_box = ui.add(
                     egui::TextEdit::singleline(&mut self.search_query)
-                        .desired_width(170.0)
-                        .hint_text("Filter name or publisher..."),
+                        .id(search_id)
+                        .desired_width(180.0)
+                        .hint_text("Filter name or publisher (Ctrl+F)..."),
                 );
                 if search_box.changed() {
                     self.selected_index = None;
@@ -394,7 +511,7 @@ impl eframe::App for BcuApp {
 
                 ui.separator();
 
-                ui.label("Sort:");
+                ui.colored_label(theme::TEXT_MUTED, "Sort:");
                 let prev_sort = self.sort_option;
                 egui::ComboBox::from_id_salt("sort_combo")
                     .selected_text(match self.sort_option {
@@ -434,14 +551,24 @@ impl eframe::App for BcuApp {
                 if refresh_btn.clicked() {
                     self.start_scan();
                 }
-                show_fade_tooltip(ui, &refresh_btn, "Rescan registry and installed applications");
+                show_fade_tooltip(ui, &refresh_btn, "Rescan registry and installed applications (F5)");
 
                 let checked_count = self.checked_indices.len();
                 if checked_count > 0 {
                     ui.separator();
+                    let label = if self.checked_total_bytes > 0 {
+                        format!(
+                            "Uninstall Selected ({} · {})",
+                            checked_count,
+                            format_bytes(self.checked_total_bytes)
+                        )
+                    } else {
+                        format!("Uninstall Selected ({})", checked_count)
+                    };
                     let uninstall_btn = ui.add_enabled(
                         !self.is_scanning,
-                        egui::Button::new(format!("Uninstall Selected ({})", checked_count)),
+                        egui::Button::new(RichText::new(label).color(Color32::WHITE).strong())
+                            .fill(theme::DANGER_BTN),
                     );
                     show_fade_tooltip(ui, &uninstall_btn, "Launch silent uninstaller for checked programs");
                     if uninstall_btn.clicked() {
@@ -467,8 +594,12 @@ impl eframe::App for BcuApp {
                     }
                 }
             });
-            ui.add_space(4.0);
+            ui.add_space(6.0);
         });
+
+        if self.is_scanning || self.is_scanning_junk || self.is_scanning_registry {
+            draw_top_progress_bar(ctx, top_panel.response.rect);
+        }
 
         // Bottom status / detail panel
         let selected_app = self.selected_index.and_then(|idx| self.apps.get(idx)).cloned();
@@ -478,16 +609,30 @@ impl eframe::App for BcuApp {
                 .resizable(true)
                 .default_height(260.0)
                 .show(ctx, |ui| {
-                    ui.add_space(4.0);
-                    ui.horizontal(|ui| {
-                        ui.heading(&app.display_name);
+                    ui.add_space(6.0);
+                    ui.horizontal_wrapped(|ui| {
+                        if let Some(tex) = self.icon_textures.get(&app.id) {
+                            ui.image((tex.id(), Vec2::splat(18.0)));
+                        } else {
+                            draw_monogram_icon(ui, &app.display_name);
+                        }
+                        ui.label(RichText::new(&app.display_name).size(16.0).strong());
                         if app.is_protected {
-                            ui.colored_label(Color32::from_rgb(241, 196, 15), "[PROTECTED]");
+                            draw_pill(ui, "PROTECTED", Color32::from_rgb(74, 54, 18), Color32::from_rgb(253, 224, 71));
                         }
                         if is_uninstaller_missing(&app) {
-                            ui.colored_label(Color32::from_rgb(231, 76, 60), "[BROKEN]");
+                            draw_pill(ui, "BROKEN", Color32::from_rgb(76, 29, 34), Color32::from_rgb(252, 165, 165));
                         }
                         ui.separator();
+
+                        if let Some(ref loc) = app.install_location {
+                            let exists = loc.exists();
+                            let open_btn = ui.add_enabled(exists, egui::Button::new("Open Folder"));
+                            show_fade_tooltip(ui, &open_btn, "Open installation folder in Windows Explorer");
+                            if open_btn.clicked() {
+                                let _ = Command::new("explorer.exe").arg(loc).spawn();
+                            }
+                        }
 
                         if app.uninstaller_kind != UninstallerKind::StoreApp && app.registry_location.is_some() {
                             let force_btn = ui.add_enabled(!self.is_scanning, egui::Button::new("Force Uninstall"));
@@ -498,7 +643,11 @@ impl eframe::App for BcuApp {
                         }
 
                         if app.quiet_uninstall_string.is_some() {
-                            let quiet_btn = ui.add_enabled(!self.is_scanning, egui::Button::new("Run Quiet Uninstall"));
+                            let quiet_btn = ui.add_enabled(
+                                !self.is_scanning,
+                                egui::Button::new(RichText::new("Run Quiet Uninstall").color(Color32::WHITE))
+                                    .fill(theme::ACCENT),
+                            );
                             show_fade_tooltip(ui, &quiet_btn, "Run vendor uninstaller in silent/unattended mode");
                             if quiet_btn.clicked() {
                                 self.request_uninstall_targets(vec![app.clone()]);
@@ -513,174 +662,171 @@ impl eframe::App for BcuApp {
                             self.start_junk_scan(name, dir);
                         }
 
-                        if !self.junk_items.is_empty() {
-                            let recycle_btn = ui.button("Send Safe Junk to Recycle Bin");
-                            show_fade_tooltip(ui, &recycle_btn, "Move safe leftover files to Windows Recycle Bin");
-                            if recycle_btn.clicked() {
-                                let safe_junk = filter_safe_junk(&self.junk_items);
-                                let (cleaned, errors) = clean_junk_items(&safe_junk, false);
-                                let summary = build_cleanup_summary(
-                                    &[app.display_name.clone()],
-                                    &safe_junk,
-                                    &[],
-                                    cleaned,
-                                    &errors,
-                                    0,
-                                );
-                                self.status_text = match maybe_create_desktop_zip(cleaned, None, &summary) {
-                                    Some(Ok(zp)) => format!("Recycled {} item(s). Backup: {}", cleaned, zp.display()),
-                                    Some(Err(e)) => format!("Recycled {} item(s). Zip backup failed: {}", cleaned, e),
-                                    None if errors.is_empty() => format!("Recycled {} safe item(s).", cleaned),
-                                    None => format!("Recycled 0 item(s), {} failed.", errors.len()),
-                                };
-                                if cleaned > 0 {
-                                    self.junk_items.clear();
-                                }
-                            }
-                        }
-
                         let reg_btn = ui.button("Scan Deep Registry");
                         show_fade_tooltip(ui, &reg_btn, "Search HKCU/HKLM for leftover keys and values");
                         if reg_btn.clicked() {
                             self.start_registry_scan(app.clone());
                         }
-
-                        if !self.registry_remnants.is_empty() {
-                            let clean_reg_btn = ui.button("Backup & Clean Registry");
-                            show_fade_tooltip(ui, &clean_reg_btn, "Export rollback backup .reg + Desktop .zip before cleaning");
-                            if clean_reg_btn.clicked() {
-                                let safe_remnants = filter_safe_remnants(&self.registry_remnants);
-                                match clean_registry_remnants(&safe_remnants, None, &app.id) {
-                                    Ok((backup_path, deleted, errors)) => {
-                                        let summary = build_cleanup_summary(
-                                            &[app.display_name.clone()],
-                                            &[],
-                                            &safe_remnants,
-                                            0,
-                                            &errors,
-                                            deleted,
-                                        );
-                                        let zip_path = maybe_create_desktop_zip(
-                                            deleted,
-                                            Some(&backup_path),
-                                            &summary,
-                                        )
-                                        .and_then(Result::ok);
-                                        let shown_backup = zip_path.unwrap_or(backup_path);
-                                        self.status_text = if errors.is_empty() {
-                                            format!(
-                                                "Cleaned {} registry remnant(s)! Backup: {}",
-                                                deleted,
-                                                shown_backup.display()
-                                            )
-                                        } else {
-                                            format!(
-                                                "Cleaned {} remnant(s), {} failed (try Run as Administrator). Backup: {}",
-                                                deleted,
-                                                errors.len(),
-                                                shown_backup.display()
-                                            )
-                                        };
-                                        if deleted > 0 {
-                                            self.registry_remnants.clear();
-                                        }
-                                    }
-                                    Err(err) => {
-                                        self.status_text = format!("Error cleaning registry: {}", err);
-                                    }
-                                }
-                            }
-                        }
-
-                        if self.is_scanning_junk || self.is_scanning_registry {
-                            ui.spinner();
-                            ui.label("Scanning...");
-                        }
                     });
 
+                    ui.add_space(4.0);
                     ui.separator();
+                    ui.add_space(4.0);
 
-                    ui.horizontal(|ui| {
-                        ui.vertical(|ui| {
-                            ui.label(format!("ID: {}", app.id));
-                            ui.label(format!("Version: {}", app.display_version.as_deref().unwrap_or("-")));
-                            ui.label(format!("Publisher: {}", app.publisher.as_deref().unwrap_or("-")));
-                            ui.label(format!("Type: {:?}", app.uninstaller_kind));
-                            ui.label(format!(
-                                "Install Path: {}",
-                                app.install_location
+                    ui.columns(2, |cols| {
+                        // Left inspector column: key-value metadata grid
+                        egui::Grid::new("detail_meta_grid")
+                            .num_columns(2)
+                            .spacing([12.0, 5.0])
+                            .show(&mut cols[0], |ui| {
+                                let meta_row = |ui: &mut Ui, label: &str, val: &str| {
+                                    ui.colored_label(theme::TEXT_MUTED, label);
+                                    ui.label(val);
+                                    ui.end_row();
+                                };
+                                meta_row(ui, "ID", &app.id);
+                                meta_row(ui, "Version", app.display_version.as_deref().unwrap_or("-"));
+                                meta_row(ui, "Publisher", app.publisher.as_deref().unwrap_or("-"));
+                                meta_row(ui, "Installer", &format!("{:?}", app.uninstaller_kind));
+                                meta_row(ui, "Estimated Size", &format_size(app.estimated_size_bytes));
+                                let path_str = app
+                                    .install_location
                                     .as_ref()
                                     .map(|p| p.display().to_string())
-                                    .unwrap_or_else(|| "-".into())
-                            ));
-                            ui.label(format!("Estimated Size: {}", format_size(app.estimated_size_bytes)));
-                            ui.label(format!("Quiet Command: {}", app.quiet_uninstall_string.as_deref().unwrap_or("-")));
-                        });
+                                    .unwrap_or_else(|| "-".into());
+                                meta_row(ui, "Install Path", &path_str);
+                                meta_row(ui, "Quiet Command", app.quiet_uninstall_string.as_deref().unwrap_or("-"));
+                            });
 
-                        ui.separator();
-
-                        ui.vertical(|ui| {
-                            ui.strong(format!("Leftover Disk Files ({}):", self.junk_items.len()));
-                            if self.junk_items.is_empty() {
-                                if !self.is_scanning_junk {
-                                    ui.label("Click 'Scan Leftover Junk' to find remnants on disk.");
-                                }
-                            } else {
-                                egui::ScrollArea::vertical().id_salt("junk_scroll").max_height(100.0).show(ui, |ui| {
-                                    for item in &self.junk_items {
-                                        ui.horizontal(|ui| {
-                                            match item.confidence {
-                                                ConfidenceLevel::Safe => {
-                                                    ui.colored_label(Color32::from_rgb(46, 204, 113), "[SAFE]");
-                                                }
-                                                ConfidenceLevel::Questionable => {
-                                                    ui.colored_label(Color32::from_rgb(241, 196, 15), "[QUESTIONABLE]");
-                                                }
-                                                ConfidenceLevel::Dangerous => {
-                                                    ui.colored_label(Color32::from_rgb(231, 76, 60), "[DANGEROUS]");
-                                                }
-                                            }
-                                            ui.label(item.path.display().to_string());
-                                        });
+                        // Right inspector column: leftovers & registry remnants
+                        cols[1].horizontal(|ui| {
+                            ui.strong("Leftover Junk");
+                            draw_pill(
+                                ui,
+                                &self.junk_items.len().to_string(),
+                                theme::BG_ELEVATED,
+                                theme::TEXT_PRIMARY,
+                            );
+                            if !self.junk_items.is_empty() {
+                                let recycle_btn = ui.button("Send Safe Junk to Recycle Bin");
+                                show_fade_tooltip(ui, &recycle_btn, "Move safe leftover files to Windows Recycle Bin");
+                                if recycle_btn.clicked() {
+                                    let safe_junk = filter_safe_junk(&self.junk_items);
+                                    let (cleaned, errors) = clean_junk_items(&safe_junk, false);
+                                    let summary = build_cleanup_summary(
+                                        &[app.display_name.clone()],
+                                        &safe_junk,
+                                        &[],
+                                        cleaned,
+                                        &errors,
+                                        0,
+                                    );
+                                    self.status_text = match maybe_create_desktop_zip(cleaned, None, &summary) {
+                                        Some(Ok(zp)) => format!("Recycled {} item(s). Backup: {}", cleaned, zp.display()),
+                                        Some(Err(e)) => format!("Recycled {} item(s). Zip backup failed: {}", cleaned, e),
+                                        None if errors.is_empty() => format!("Recycled {} safe item(s).", cleaned),
+                                        None => format!("Recycled 0 item(s), {} failed.", errors.len()),
+                                    };
+                                    if cleaned > 0 {
+                                        self.junk_items.clear();
                                     }
-                                });
+                                }
                             }
                         });
-
-                        ui.separator();
-
-                        ui.vertical(|ui| {
-                            ui.strong(format!("Deep Registry Remnants ({}):", self.registry_remnants.len()));
-                            if self.registry_remnants.is_empty() {
-                                if !self.is_scanning_registry {
-                                    ui.label("Click 'Scan Deep Registry' to find residual keys/MuiCache.");
+                        if self.junk_items.is_empty() {
+                            cols[1].colored_label(
+                                theme::TEXT_MUTED,
+                                if self.is_scanning_junk { "Scanning disk..." } else { "No disk remnants scanned yet." },
+                            );
+                        } else {
+                            egui::ScrollArea::vertical().id_salt("junk_scroll").max_height(68.0).show(&mut cols[1], |ui| {
+                                for item in &self.junk_items {
+                                    ui.horizontal(|ui| {
+                                        let (lbl, bg, fg) = confidence_badge_colors(&item.confidence);
+                                        draw_pill(ui, lbl, bg, fg);
+                                        ui.label(item.path.display().to_string());
+                                    });
                                 }
-                            } else {
-                                egui::ScrollArea::vertical().id_salt("reg_scroll").max_height(100.0).show(ui, |ui| {
-                                    for rem in &self.registry_remnants {
-                                        ui.horizontal(|ui| {
-                                            match rem.confidence {
-                                                ConfidenceLevel::Safe => {
-                                                    ui.colored_label(Color32::from_rgb(46, 204, 113), "[SAFE]");
-                                                }
-                                                ConfidenceLevel::Questionable => {
-                                                    ui.colored_label(Color32::from_rgb(241, 196, 15), "[QUESTIONABLE]");
-                                                }
-                                                ConfidenceLevel::Dangerous => {
-                                                    ui.colored_label(Color32::from_rgb(231, 76, 60), "[DANGEROUS]");
-                                                }
-                                            }
-                                            let target = if let Some(ref vn) = rem.value_name {
-                                                format!(r"{}\{} -> {}", rem.hive, rem.subkey, vn)
+                            });
+                        }
+
+                        cols[1].add_space(6.0);
+                        cols[1].horizontal(|ui| {
+                            ui.strong("Deep Registry");
+                            draw_pill(
+                                ui,
+                                &self.registry_remnants.len().to_string(),
+                                theme::BG_ELEVATED,
+                                theme::TEXT_PRIMARY,
+                            );
+                            if !self.registry_remnants.is_empty() {
+                                let clean_reg_btn = ui.button("Backup & Clean Registry");
+                                show_fade_tooltip(ui, &clean_reg_btn, "Export rollback backup .reg + Desktop .zip before cleaning");
+                                if clean_reg_btn.clicked() {
+                                    let safe_remnants = filter_safe_remnants(&self.registry_remnants);
+                                    match clean_registry_remnants(&safe_remnants, None, &app.id) {
+                                        Ok((backup_path, deleted, errors)) => {
+                                            let summary = build_cleanup_summary(
+                                                &[app.display_name.clone()],
+                                                &[],
+                                                &safe_remnants,
+                                                0,
+                                                &errors,
+                                                deleted,
+                                            );
+                                            let zip_path = maybe_create_desktop_zip(
+                                                deleted,
+                                                Some(&backup_path),
+                                                &summary,
+                                            )
+                                            .and_then(Result::ok);
+                                            let shown_backup = zip_path.unwrap_or(backup_path);
+                                            self.status_text = if errors.is_empty() {
+                                                format!(
+                                                    "Cleaned {} registry remnant(s)! Backup: {}",
+                                                    deleted,
+                                                    shown_backup.display()
+                                                )
                                             } else {
-                                                format!(r"{}\{}", rem.hive, rem.subkey)
+                                                format!(
+                                                    "Cleaned {} remnant(s), {} failed (try Run as Administrator). Backup: {}",
+                                                    deleted,
+                                                    errors.len(),
+                                                    shown_backup.display()
+                                                )
                                             };
-                                            ui.label(target);
-                                        });
+                                            if deleted > 0 {
+                                                self.registry_remnants.clear();
+                                            }
+                                        }
+                                        Err(err) => {
+                                            self.status_text = format!("Error cleaning registry: {}", err);
+                                        }
                                     }
-                                });
+                                }
                             }
                         });
+                        if self.registry_remnants.is_empty() {
+                            cols[1].colored_label(
+                                theme::TEXT_MUTED,
+                                if self.is_scanning_registry { "Scanning registry..." } else { "No registry remnants scanned yet." },
+                            );
+                        } else {
+                            egui::ScrollArea::vertical().id_salt("reg_scroll").max_height(68.0).show(&mut cols[1], |ui| {
+                                for rem in &self.registry_remnants {
+                                    ui.horizontal(|ui| {
+                                        let (lbl, bg, fg) = confidence_badge_colors(&rem.confidence);
+                                        draw_pill(ui, lbl, bg, fg);
+                                        let target = if let Some(ref vn) = rem.value_name {
+                                            format!(r"{}\{} -> {}", rem.hive, rem.subkey, vn)
+                                        } else {
+                                            format!(r"{}\{}", rem.hive, rem.subkey)
+                                        };
+                                        ui.label(target);
+                                    });
+                                }
+                            });
+                        }
                     });
                 });
         }
@@ -903,7 +1049,7 @@ impl BcuApp {
             .column(Column::initial(100.0).at_least(75.0))
             .column(Column::initial(65.0).at_least(50.0))
             .column(Column::remainder())
-            .header(24.0, |mut header| {
+            .header(28.0, |mut header| {
                 header.col(|ui| {
                     ui.strong("Sel");
                 });
@@ -952,7 +1098,8 @@ impl BcuApp {
                 });
             })
             .body(|body| {
-                body.rows(22.0, indices.len(), |mut row| {
+                let max_size = self.max_filtered_size_bytes;
+                body.rows(28.0, indices.len(), |mut row| {
                     let row_index = row.index();
                     if let Some(&original_index) = indices.get(row_index) {
                         if let Some(app) = self.apps.get(original_index) {
@@ -967,39 +1114,103 @@ impl BcuApp {
                             });
 
                             row.col(|ui| {
-                                let label = ui.selectable_label(is_selected, &app.display_name);
-                                if label.clicked() {
+                                let row_rect = ui.available_rect_before_wrap();
+                                let resp = ui.interact(
+                                    row_rect,
+                                    ui.id().with(("name_cell", original_index)),
+                                    Sense::click(),
+                                );
+                                let highlight = ui.ctx().animate_bool(
+                                    ui.id().with(("row_anim", original_index)),
+                                    resp.hovered() || is_selected,
+                                );
+                                if highlight > 0.01 {
+                                    let alpha = if is_selected { 220 } else { (110.0 * highlight) as u8 };
+                                    ui.painter().rect_filled(
+                                        row_rect.shrink2(Vec2::new(2.0, 1.0)),
+                                        Rounding::same(5.0),
+                                        Color32::from_rgba_unmultiplied(41, 56, 82, alpha),
+                                    );
+                                    if is_selected {
+                                        ui.painter().rect_stroke(
+                                            row_rect.shrink2(Vec2::new(2.0, 1.0)),
+                                            Rounding::same(5.0),
+                                            Stroke::new(1.0_f32, theme::ACCENT),
+                                        );
+                                    }
+                                }
+
+                                ui.horizontal(|ui| {
+                                    ui.add_space(4.0);
+                                    if let Some(tex) = self.icon_textures.get(&app.id) {
+                                        ui.image((tex.id(), Vec2::splat(16.0)));
+                                    } else {
+                                        draw_monogram_icon(ui, &app.display_name);
+                                    }
+                                    ui.add(
+                                        egui::Label::new(RichText::new(&app.display_name).color(
+                                            if is_selected { Color32::WHITE } else { theme::TEXT_PRIMARY },
+                                        ))
+                                        .truncate(),
+                                    );
+                                });
+
+                                if resp.clicked() {
                                     newly_selected = Some(original_index);
                                 }
                             });
 
                             row.col(|ui| {
+                                let cell_rect = ui.available_rect_before_wrap();
+                                let ratio = size_bar_ratio(app.estimated_size_bytes, max_size);
+                                if ratio > 0.0 {
+                                    let bar_w = (cell_rect.width() - 4.0) * ratio;
+                                    let bar_rect = Rect::from_min_size(
+                                        Pos2::new(cell_rect.left() + 2.0, cell_rect.top() + 4.0),
+                                        Vec2::new(bar_w.max(3.0), (cell_rect.height() - 8.0).max(4.0)),
+                                    );
+                                    ui.painter().rect_filled(
+                                        bar_rect,
+                                        Rounding::same(3.0),
+                                        Color32::from_rgba_unmultiplied(59, 130, 246, 48),
+                                    );
+                                }
                                 let size_text = format_size(app.estimated_size_bytes);
-                                if app.estimated_size_bytes.is_some() {
-                                    ui.colored_label(Color32::from_rgb(100, 200, 255), size_text);
+                                let color = if app.estimated_size_bytes.is_some() {
+                                    Color32::from_rgb(147, 197, 253)
                                 } else {
-                                    ui.colored_label(Color32::GRAY, size_text);
-                                }
+                                    theme::TEXT_MUTED
+                                };
+                                ui.add_space(4.0);
+                                ui.colored_label(color, size_text);
                             });
 
                             row.col(|ui| {
-                                ui.label(app.display_version.as_deref().unwrap_or("-"));
+                                ui.colored_label(
+                                    theme::TEXT_MUTED,
+                                    app.display_version.as_deref().unwrap_or("-"),
+                                );
                             });
 
                             row.col(|ui| {
-                                ui.label(format!("{:?}", app.uninstaller_kind));
+                                let (bg, fg) = kind_badge_colors(&app.uninstaller_kind);
+                                draw_pill(ui, &format!("{:?}", app.uninstaller_kind), bg, fg);
                             });
 
                             row.col(|ui| {
-                                if app.quiet_uninstall_string.is_some() {
-                                    ui.colored_label(Color32::from_rgb(46, 204, 113), "YES");
-                                } else {
-                                    ui.colored_label(Color32::GRAY, "NO");
-                                }
+                                let has_quiet = app.quiet_uninstall_string.is_some();
+                                let (bg, fg) = quiet_badge_colors(has_quiet);
+                                draw_pill(ui, if has_quiet { "YES" } else { "NO" }, bg, fg);
                             });
 
                             row.col(|ui| {
-                                ui.label(app.publisher.as_deref().unwrap_or("-"));
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(app.publisher.as_deref().unwrap_or("-"))
+                                            .color(theme::TEXT_MUTED),
+                                    )
+                                    .truncate(),
+                                );
                             });
                         }
                     }
@@ -1017,6 +1228,7 @@ impl BcuApp {
             } else {
                 self.checked_indices.remove(&idx);
             }
+            self.recompute_checked_bytes();
         }
 
         if let Some(idx) = newly_selected {
@@ -1235,6 +1447,7 @@ mod tests {
             is_system_component: false,
             is_protected: false,
             registry_location: None,
+            display_icon: None,
         };
 
         let cancelled = app("1", "CancelledApp");
@@ -1260,6 +1473,7 @@ mod tests {
             is_system_component: false,
             is_protected: false,
             registry_location: None,
+            display_icon: None,
         };
         assert!(is_uninstaller_missing(&app));
 
@@ -1310,6 +1524,7 @@ mod tests {
             is_system_component: false,
             is_protected: true,
             registry_location: None,
+            display_icon: None,
         };
         gui.request_uninstall_targets(vec![protected_app]);
         assert!(gui.pending_confirm.is_some());

@@ -1,6 +1,7 @@
+use crate::theme::{confidence_badge_colors, draw_pill};
 use bcu_core::models::{ConfidenceLevel, JunkItem};
 use bcu_core::registry_deep::RegistryRemnant;
-use eframe::egui::{self, Color32};
+use eframe::egui;
 
 /// Formats a byte count into a human-readable B/KB/MB/GB string.
 pub fn format_bytes(bytes: u64) -> String {
@@ -165,17 +166,8 @@ impl CleanupModalState {
 }
 
 fn confidence_badge(ui: &mut egui::Ui, level: &ConfidenceLevel) {
-    match level {
-        ConfidenceLevel::Safe => {
-            ui.colored_label(Color32::from_rgb(46, 204, 113), "[SAFE]");
-        }
-        ConfidenceLevel::Questionable => {
-            ui.colored_label(Color32::from_rgb(241, 196, 15), "[QUESTIONABLE]");
-        }
-        ConfidenceLevel::Dangerous => {
-            ui.colored_label(Color32::from_rgb(231, 76, 60), "[DANGEROUS]");
-        }
-    }
+    let (label, bg, fg) = confidence_badge_colors(level);
+    draw_pill(ui, label, bg, fg);
 }
 
 #[cfg(test)]

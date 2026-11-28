@@ -89,6 +89,11 @@ fn scan_hive(
         let quiet_uninstall_string: Option<String> =
             app_key.get_value("QuietUninstallString").ok();
         let install_date: Option<String> = app_key.get_value("InstallDate").ok();
+        let display_icon: Option<String> = app_key
+            .get_value::<String, _>("DisplayIcon")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
 
         let estimated_size_bytes: Option<u64> = app_key
             .get_value::<u32, _>("EstimatedSize")
@@ -149,6 +154,7 @@ fn scan_hive(
                 hive,
                 subkey_path: format!(r"{}\{}", sub_path, subkey_name),
             }),
+            display_icon,
         });
     }
 }

@@ -651,6 +651,7 @@ mod tests {
             is_system_component: false,
             is_protected: false,
             registry_location: None,
+            display_icon: None,
         };
         assert!(force_remove_uninstall_entry(&store_app, None).is_err());
 

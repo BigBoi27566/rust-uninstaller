@@ -2,6 +2,7 @@
 
 mod app;
 mod cleanup_modal;
+mod theme;
 
 use app::BcuApp;
 use eframe::egui;

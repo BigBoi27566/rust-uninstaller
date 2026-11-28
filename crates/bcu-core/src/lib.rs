@@ -1,6 +1,7 @@
 pub mod automation;
 pub mod export;
 pub mod heuristics;
+pub mod icons;
 pub mod junk;
 pub mod models;
 pub mod queue;

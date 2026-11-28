@@ -74,6 +74,7 @@ pub fn scan_store_apps() -> Vec<ApplicationEntry> {
             is_system_component: false,
             is_protected: false,
             registry_location: None,
+            display_icon: None,
         });
     }
 

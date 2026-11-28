@@ -1,7 +1,9 @@
 use bcu_core::heuristics::{
-    detect_uninstaller_kind, matches_app_name, parse_command_line, synthesize_quiet_command,
+    detect_uninstaller_kind, matches_app_name, parse_command_line, parse_display_icon_spec,
+    synthesize_quiet_command,
 };
 use bcu_core::models::UninstallerKind;
+use std::path::PathBuf;
 
 #[test]
 fn test_detect_inno_setup() {
@@ -65,4 +67,21 @@ fn test_matches_app_name_word_boundaries() {
     assert!(!matches_app_name("GitHub", "Git"));
     assert!(matches_app_name("Go", "Go"));
     assert!(!matches_app_name("Google Chrome", "Go"));
+}
+
+#[test]
+fn test_parse_display_icon_spec() {
+    assert_eq!(
+        parse_display_icon_spec(r#""C:\Program Files\App\app.exe",0"#),
+        Some((PathBuf::from(r"C:\Program Files\App\app.exe"), 0))
+    );
+    assert_eq!(
+        parse_display_icon_spec(r#"C:\Tools\tool.exe,-101"#),
+        Some((PathBuf::from(r"C:\Tools\tool.exe"), -101))
+    );
+    assert_eq!(
+        parse_display_icon_spec(r#""C:\App\icon.ico""#),
+        Some((PathBuf::from(r"C:\App\icon.ico"), 0))
+    );
+    assert_eq!(parse_display_icon_spec("   "), None);
 }

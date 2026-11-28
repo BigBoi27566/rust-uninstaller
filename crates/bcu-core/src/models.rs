@@ -48,6 +48,8 @@ pub struct ApplicationEntry {
     pub is_protected: bool,
     #[serde(default)]
     pub registry_location: Option<RegistryLocation>,
+    #[serde(default)]
+    pub display_icon: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

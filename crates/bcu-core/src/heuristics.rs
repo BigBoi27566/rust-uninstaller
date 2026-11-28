@@ -156,3 +156,40 @@ pub fn matches_app_name(candidate: &str, app_name: &str) -> bool {
     })
 }
 
+/// Parses a Windows `DisplayIcon` string (e.g. `"C:\App\app.exe",0` or `C:\App\app.exe,-101`)
+/// into `(file_path, icon_index)`.
+pub fn parse_display_icon_spec(raw: &str) -> Option<(std::path::PathBuf, i32)> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let (path_str, index) = if let Some(after_open) = trimmed.strip_prefix('"') {
+        if let Some(end_quote) = after_open.find('"') {
+            let path = after_open[..end_quote].trim();
+            let rest = after_open[end_quote + 1..].trim();
+            let idx = rest
+                .strip_prefix(',')
+                .and_then(|s| s.trim().parse::<i32>().ok())
+                .unwrap_or(0);
+            (path, idx)
+        } else {
+            (after_open.trim(), 0)
+        }
+    } else if let Some((left, right)) = trimmed.rsplit_once(',') {
+        if let Ok(idx) = right.trim().parse::<i32>() {
+            (left.trim(), idx)
+        } else {
+            (trimmed, 0)
+        }
+    } else {
+        (trimmed, 0)
+    };
+
+    if path_str.is_empty() {
+        None
+    } else {
+        Some((std::path::PathBuf::from(path_str), index))
+    }
+}
+

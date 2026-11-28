@@ -31,6 +31,7 @@ fn test_filter_applications_by_name_and_publisher() {
             is_system_component: false,
             is_protected: false,
             registry_location: None,
+            display_icon: None,
         },
         ApplicationEntry {
             id: "2".into(),
@@ -46,6 +47,7 @@ fn test_filter_applications_by_name_and_publisher() {
             is_system_component: false,
             is_protected: false,
             registry_location: None,
+            display_icon: None,
         },
     ];
 
@@ -78,6 +80,7 @@ fn test_sort_applications_by_name_and_size() {
             is_system_component: false,
             is_protected: false,
             registry_location: None,
+            display_icon: None,
         },
         ApplicationEntry {
             id: "2".into(),
@@ -93,6 +96,7 @@ fn test_sort_applications_by_name_and_size() {
             is_system_component: false,
             is_protected: false,
             registry_location: None,
+            display_icon: None,
         },
         ApplicationEntry {
             id: "3".into(),
@@ -108,6 +112,7 @@ fn test_sort_applications_by_name_and_size() {
             is_system_component: false,
             is_protected: false,
             registry_location: None,
+            display_icon: None,
         },
     ];
 

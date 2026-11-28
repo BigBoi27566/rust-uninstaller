@@ -16,6 +16,7 @@ fn test_application_entry_serialization() {
         is_system_component: false,
         is_protected: false,
         registry_location: None,
+        display_icon: None,
     };
 
     let json = serde_json::to_string(&entry).expect("Must serialize to JSON");

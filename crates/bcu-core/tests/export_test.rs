@@ -17,6 +17,7 @@ fn test_export_csv_escapes_commas_and_quotes() {
         is_system_component: false,
         is_protected: false,
         registry_location: None,
+        display_icon: None,
     };
 
     let csv = export_to_csv(&[app]);
@@ -41,6 +42,7 @@ fn test_export_json_valid_array() {
         is_system_component: false,
         is_protected: false,
         registry_location: None,
+        display_icon: None,
     };
 
     let json = export_to_json(&[app]);

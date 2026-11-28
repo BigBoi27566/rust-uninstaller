@@ -19,6 +19,7 @@ fn test_queue_ordering_and_msi_collision_prevention() {
         is_system_component: false,
         is_protected: false,
         registry_location: None,
+        display_icon: None,
     };
 
     let msi_app_2 = ApplicationEntry {
@@ -35,6 +36,7 @@ fn test_queue_ordering_and_msi_collision_prevention() {
         is_system_component: false,
         is_protected: false,
         registry_location: None,
+        display_icon: None,
     };
 
     let inno_app = ApplicationEntry {
@@ -51,6 +53,7 @@ fn test_queue_ordering_and_msi_collision_prevention() {
         is_system_component: false,
         is_protected: false,
         registry_location: None,
+        display_icon: None,
     };
 
     queue.add(msi_app_1);
@@ -98,6 +101,7 @@ fn test_duplicate_app_id_transitions_separately() {
         is_system_component: false,
         is_protected: false,
         registry_location: None,
+        display_icon: None,
     };
 
     queue.add(make_app());
