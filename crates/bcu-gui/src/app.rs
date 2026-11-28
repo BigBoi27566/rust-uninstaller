@@ -133,8 +133,8 @@ impl BcuApp {
         // Check for --scan-dir CLI parameter (Explorer context menu)
         let args: Vec<String> = env::args().collect();
         if let Some(pos) = args.iter().position(|a| a == "--scan-dir" || a == "-d") {
-            if let Some(dir) = args.get(pos + 1) {
-                app.scan_dir_filter = Some(dir.clone());
+            if let Some(dir) = args.get(pos + 1).map(|s| s.trim()).filter(|s| !s.is_empty()) {
+                app.scan_dir_filter = Some(dir.to_string());
             }
         }
 
@@ -480,7 +480,7 @@ impl eframe::App for BcuApp {
                 .show(ctx, |ui| {
                     ui.add_space(4.0);
                     ui.horizontal(|ui| {
-                        ui.heading(format!("📦 {}", app.display_name));
+                        ui.heading(&app.display_name);
                         if app.is_protected {
                             ui.colored_label(Color32::from_rgb(241, 196, 15), "[PROTECTED]");
                         }
@@ -1138,7 +1138,12 @@ fn matches_install_dir(install_location: Option<&std::path::Path>, target_dir: &
     let Some(loc) = install_location else {
         return false;
     };
-    let norm = |s: &str| s.trim().trim_end_matches(['\\', '/']).to_lowercase();
+    let norm = |s: &str| {
+        s.trim()
+            .replace('/', "\\")
+            .trim_end_matches('\\')
+            .to_lowercase()
+    };
     let target = norm(target_dir);
     !target.is_empty() && norm(&loc.to_string_lossy()) == target
 }
@@ -1278,6 +1283,10 @@ mod tests {
         assert!(matches_install_dir(
             Some(std::path::Path::new(r"C:\Program Files\VLC")),
             r"c:\program files\vlc\"
+        ));
+        assert!(matches_install_dir(
+            Some(std::path::Path::new(r"C:\Program Files\VLC")),
+            "c:/program files/vlc/"
         ));
         assert!(!matches_install_dir(None, r"C:\Program Files\VLC"));
     }
