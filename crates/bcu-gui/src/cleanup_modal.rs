@@ -1,7 +1,19 @@
-use crate::treemap::format_bytes;
 use bcu_core::models::{ConfidenceLevel, JunkItem};
 use bcu_core::registry_deep::RegistryRemnant;
 use eframe::egui::{self, Color32};
+
+/// Formats a byte count into a human-readable B/KB/MB/GB string.
+pub fn format_bytes(bytes: u64) -> String {
+    if bytes >= 1024 * 1024 * 1024 {
+        format!("{:.2} GB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
+    } else if bytes >= 1024 * 1024 {
+        format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+    } else if bytes >= 1024 {
+        format!("{} KB", bytes / 1024)
+    } else {
+        format!("{} B", bytes)
+    }
+}
 
 pub enum CleanupAction {
     Clean {

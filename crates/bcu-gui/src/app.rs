@@ -1,11 +1,9 @@
-use crate::cleanup_modal::{CleanupAction, CleanupModalState};
-use crate::treemap::{render_treemap, SquarifiedTreeMap, TreeMapItem};
-use bcu_core::automation::run_automation_cycle;
-use bcu_core::export::export_to_csv;
+use crate::cleanup_modal::{format_bytes, CleanupAction, CleanupModalState};
 use bcu_core::junk::{scan_disk_junk, scan_disk_junk_deep};
 use bcu_core::models::{ApplicationEntry, ConfidenceLevel, JunkItem, UninstallerKind};
 use bcu_core::queue::{TaskStatus, UninstallQueue};
 use bcu_core::recycle::clean_junk_items;
+use bcu_core::reg_backup::RegBackup;
 use bcu_core::registry::scan_registry_uninstallers;
 use bcu_core::registry_deep::{
     clean_registry_remnants, clean_registry_remnants_selective, force_remove_uninstall_entry,
@@ -16,7 +14,7 @@ use eframe::egui::{self, Color32, Response, Ui};
 use egui_extras::{Column, TableBuilder};
 use std::collections::HashSet;
 use std::env;
-use std::fs;
+use std::path::PathBuf;
 use std::process::{Child, Command};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::thread;
@@ -53,25 +51,13 @@ pub enum SortOption {
     SizeAsc,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ViewMode {
-    Table,
-    DiskMap,
-}
-
 #[derive(Debug, Clone)]
 pub enum ConfirmAction {
     BatchUninstall {
         targets: Vec<ApplicationEntry>,
-        skip_restore_point: bool,
     },
     ForceUninstall {
         app: ApplicationEntry,
-        skip_restore_point: bool,
-    },
-    RestorePointFailed {
-        error: String,
-        next: Box<ConfirmAction>,
     },
 }
 
@@ -87,10 +73,6 @@ pub enum AppEvent {
         junk: Vec<JunkItem>,
         remnants: Vec<RegistryRemnant>,
     },
-    RestorePointResult {
-        res: Result<(), String>,
-        next: ConfirmAction,
-    },
     JunkLoaded(Vec<JunkItem>),
     RegistryLoaded(Vec<RegistryRemnant>),
 }
@@ -100,10 +82,7 @@ pub struct BcuApp {
     pub scan_dir_filter: Option<String>,
     pub include_store: bool,
     pub show_system_components: bool,
-    pub create_restore_point: bool,
     pub sort_option: SortOption,
-    pub view_mode: ViewMode,
-    pub auto_click_helper: bool,
     pub apps: Vec<ApplicationEntry>,
     pub cached_indices: Vec<usize>,
     pub selected_index: Option<usize>,
@@ -128,10 +107,7 @@ impl Default for BcuApp {
             scan_dir_filter: None,
             include_store: false,
             show_system_components: false,
-            create_restore_point: false,
             sort_option: SortOption::NameAsc,
-            view_mode: ViewMode::Table,
-            auto_click_helper: false,
             apps: Vec::new(),
             cached_indices: Vec::new(),
             selected_index: None,
@@ -325,15 +301,9 @@ impl BcuApp {
             return;
         }
         if targets.iter().any(|a| a.is_protected) {
-            self.pending_confirm = Some(ConfirmAction::BatchUninstall {
-                targets,
-                skip_restore_point: false,
-            });
+            self.pending_confirm = Some(ConfirmAction::BatchUninstall { targets });
         } else {
-            self.execute_confirm_action(ConfirmAction::BatchUninstall {
-                targets,
-                skip_restore_point: false,
-            });
+            self.execute_confirm_action(ConfirmAction::BatchUninstall { targets });
         }
     }
 
@@ -358,18 +328,6 @@ impl BcuApp {
                     self.status_text = status;
                     if !removed_targets.is_empty() {
                         self.start_post_uninstall_scan(removed_targets);
-                    }
-                }
-                AppEvent::RestorePointResult { res, next } => {
-                    self.is_scanning = false;
-                    match res {
-                        Ok(()) => self.execute_confirm_action(next),
-                        Err(err) => {
-                            self.pending_confirm = Some(ConfirmAction::RestorePointFailed {
-                                error: err,
-                                next: Box::new(next),
-                            });
-                        }
                     }
                 }
                 AppEvent::PostUninstallCleanupReady {
@@ -419,46 +377,44 @@ impl eframe::App for BcuApp {
             ui.separator();
             ui.add_space(2.0);
 
-            // Row 2: Search, sort options, filters and action buttons
-            ui.horizontal(|ui| {
-                ui.label("🔍 Search:");
-                let search_box = ui.text_edit_singleline(&mut self.search_query);
+            // Row 2: Search, sort options, filters and action buttons (wrapped so nothing clips at min width)
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Search:");
+                let search_box = ui.add(
+                    egui::TextEdit::singleline(&mut self.search_query)
+                        .desired_width(170.0)
+                        .hint_text("Filter name or publisher..."),
+                );
                 if search_box.changed() {
                     self.selected_index = None;
                     self.recompute_filtered_indices();
                 }
 
-                if self.scan_dir_filter.is_some() && ui.button("✖ Dir Filter").clicked() {
+                if self.scan_dir_filter.is_some() && ui.button("Clear Dir Filter").clicked() {
                     self.scan_dir_filter = None;
                     self.recompute_filtered_indices();
                 }
 
                 ui.separator();
 
-                // Sort Selector
                 ui.label("Sort:");
                 let prev_sort = self.sort_option;
                 egui::ComboBox::from_id_salt("sort_combo")
                     .selected_text(match self.sort_option {
-                        SortOption::NameAsc => "🔤 Name (A → Z)",
-                        SortOption::NameDesc => "🔤 Name (Z → A)",
-                        SortOption::SizeDesc => "📦 Size (High → Low)",
-                        SortOption::SizeAsc => "📦 Size (Low → High)",
+                        SortOption::NameAsc => "Name (A-Z)",
+                        SortOption::NameDesc => "Name (Z-A)",
+                        SortOption::SizeDesc => "Size (High-Low)",
+                        SortOption::SizeAsc => "Size (Low-High)",
                     })
                     .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut self.sort_option, SortOption::NameAsc, "🔤 Name (A → Z)");
-                        ui.selectable_value(&mut self.sort_option, SortOption::NameDesc, "🔤 Name (Z → A)");
-                        ui.selectable_value(&mut self.sort_option, SortOption::SizeDesc, "📦 Size (High → Low)");
-                        ui.selectable_value(&mut self.sort_option, SortOption::SizeAsc, "📦 Size (Low → High)");
+                        ui.selectable_value(&mut self.sort_option, SortOption::NameAsc, "Name (A-Z)");
+                        ui.selectable_value(&mut self.sort_option, SortOption::NameDesc, "Name (Z-A)");
+                        ui.selectable_value(&mut self.sort_option, SortOption::SizeDesc, "Size (High-Low)");
+                        ui.selectable_value(&mut self.sort_option, SortOption::SizeAsc, "Size (Low-High)");
                     });
                 if self.sort_option != prev_sort {
                     self.recompute_filtered_indices();
                 }
-
-                ui.separator();
-
-                ui.selectable_value(&mut self.view_mode, ViewMode::Table, "📋 Table");
-                ui.selectable_value(&mut self.view_mode, ViewMode::DiskMap, "🗺 Disk Map");
 
                 ui.separator();
 
@@ -468,39 +424,24 @@ impl eframe::App for BcuApp {
                 }
                 show_fade_tooltip(ui, &store_cb, "Include Universal Windows Platform (UWP) apps");
 
-                // Opt-in Quiet Automation Helper
-                let auto_cb = ui.checkbox(&mut self.auto_click_helper, "🤖 Auto-Click");
-                show_fade_tooltip(ui, &auto_cb, "Automatically confirm uninstaller dialogues");
-
                 let sys_cb = ui.checkbox(&mut self.show_system_components, "Show System");
                 if sys_cb.changed() {
                     self.recompute_filtered_indices();
                 }
                 show_fade_tooltip(ui, &sys_cb, "Show Windows SystemComponent entries");
 
-                let rp_cb = ui.checkbox(&mut self.create_restore_point, "Restore Point");
-                show_fade_tooltip(ui, &rp_cb, "Create a System Restore Point before batch/force uninstall");
-
                 ui.separator();
 
-                let refresh_btn = ui.button("🔄 Refresh");
+                let refresh_btn = ui.button("Refresh");
                 if refresh_btn.clicked() {
                     self.start_scan();
                 }
                 show_fade_tooltip(ui, &refresh_btn, "Rescan registry and installed applications");
 
-                let export_btn = ui.button("📄 Export CSV");
-                if export_btn.clicked() {
-                    let csv = export_to_csv(&self.apps);
-                    let _ = fs::write("installed_apps.csv", csv);
-                    self.status_text = "Exported list to 'installed_apps.csv'".into();
-                }
-                show_fade_tooltip(ui, &export_btn, "Save application inventory to CSV spreadsheet");
-
                 let checked_count = self.checked_indices.len();
                 if checked_count > 0 {
                     ui.separator();
-                    let uninstall_btn = ui.button(format!("⚡ Uninstall Selected ({})", checked_count));
+                    let uninstall_btn = ui.button(format!("Uninstall Selected ({})", checked_count));
                     show_fade_tooltip(ui, &uninstall_btn, "Launch silent uninstaller for checked programs");
                     if uninstall_btn.clicked() {
                         let mut targets = Vec::new();
@@ -548,25 +489,22 @@ impl eframe::App for BcuApp {
                         ui.separator();
 
                         if app.uninstaller_kind != UninstallerKind::StoreApp && app.registry_location.is_some() {
-                            let force_btn = ui.button("🔨 Force Uninstall");
+                            let force_btn = ui.button("Force Uninstall");
                             show_fade_tooltip(ui, &force_btn, "Remove Uninstall registry entry and scan leftovers");
                             if force_btn.clicked() {
-                                self.pending_confirm = Some(ConfirmAction::ForceUninstall {
-                                    app: app.clone(),
-                                    skip_restore_point: false,
-                                });
+                                self.pending_confirm = Some(ConfirmAction::ForceUninstall { app: app.clone() });
                             }
                         }
 
                         if app.quiet_uninstall_string.is_some() {
-                            let quiet_btn = ui.button("⚡ Run Quiet Uninstall");
+                            let quiet_btn = ui.button("Run Quiet Uninstall");
                             show_fade_tooltip(ui, &quiet_btn, "Run vendor uninstaller in silent/unattended mode");
                             if quiet_btn.clicked() {
                                 self.request_uninstall_targets(vec![app.clone()]);
                             }
                         }
 
-                        let junk_btn = ui.button("🧹 Scan Leftover Junk");
+                        let junk_btn = ui.button("Scan Leftover Junk");
                         show_fade_tooltip(ui, &junk_btn, "Detect orphaned folders and files in ProgramFiles/AppData");
                         if junk_btn.clicked() {
                             let name = app.display_name.clone();
@@ -575,42 +513,65 @@ impl eframe::App for BcuApp {
                         }
 
                         if !self.junk_items.is_empty() {
-                            let recycle_btn = ui.button("🗑️ Send Safe Junk to Recycle Bin");
+                            let recycle_btn = ui.button("Send Safe Junk to Recycle Bin");
                             show_fade_tooltip(ui, &recycle_btn, "Move safe leftover files to Windows Recycle Bin");
                             if recycle_btn.clicked() {
                                 let (cleaned, errors) = clean_junk_items(&self.junk_items, false);
-                                self.status_text = format!("Recycled {} item(s) to Recycle Bin.", cleaned);
-                                for err in errors {
-                                    eprintln!("{}", err);
-                                }
+                                let summary = build_cleanup_summary(
+                                    &[app.display_name.clone()],
+                                    &self.junk_items,
+                                    &[],
+                                    cleaned,
+                                    &errors,
+                                    0,
+                                );
+                                let zip_res = RegBackup::create_desktop_backup_zip(None, &summary);
+                                self.status_text = match zip_res {
+                                    Ok(zp) => format!("Recycled {} item(s). Backup: {}", cleaned, zp.display()),
+                                    Err(e) => format!("Recycled {} item(s). Zip backup failed: {}", cleaned, e),
+                                };
                                 self.junk_items.clear();
                             }
                         }
 
-                        let reg_btn = ui.button("🔍 Scan Deep Registry");
+                        let reg_btn = ui.button("Scan Deep Registry");
                         show_fade_tooltip(ui, &reg_btn, "Search HKCU/HKLM for leftover keys and values");
                         if reg_btn.clicked() {
                             self.start_registry_scan(app.clone());
                         }
 
                         if !self.registry_remnants.is_empty() {
-                            let clean_reg_btn = ui.button("🛡️ Create .reg Backup & Clean");
-                            show_fade_tooltip(ui, &clean_reg_btn, "Export rollback backup .reg before cleaning remnants");
+                            let clean_reg_btn = ui.button("Backup & Clean Registry");
+                            show_fade_tooltip(ui, &clean_reg_btn, "Export rollback backup .reg + Desktop .zip before cleaning");
                             if clean_reg_btn.clicked() {
                                 match clean_registry_remnants(&self.registry_remnants, None, &app.id) {
                                     Ok((backup_path, deleted, errors)) => {
+                                        let summary = build_cleanup_summary(
+                                            &[app.display_name.clone()],
+                                            &[],
+                                            &self.registry_remnants,
+                                            0,
+                                            &errors,
+                                            deleted,
+                                        );
+                                        let zip_path = RegBackup::create_desktop_backup_zip(
+                                            Some(&backup_path),
+                                            &summary,
+                                        )
+                                        .ok();
+                                        let shown_backup = zip_path.unwrap_or(backup_path);
                                         self.status_text = if errors.is_empty() {
                                             format!(
                                                 "Cleaned {} registry remnant(s)! Backup: {}",
                                                 deleted,
-                                                backup_path.display()
+                                                shown_backup.display()
                                             )
                                         } else {
                                             format!(
                                                 "Cleaned {} remnant(s), {} failed (try Run as Administrator). Backup: {}",
                                                 deleted,
                                                 errors.len(),
-                                                backup_path.display()
+                                                shown_backup.display()
                                             )
                                         };
                                         if deleted > 0 {
@@ -720,14 +681,7 @@ impl eframe::App for BcuApp {
         // Central Panel
         egui::CentralPanel::default().show(ctx, |ui| {
             let indices = self.cached_indices.clone();
-            match self.view_mode {
-                ViewMode::Table => {
-                    self.render_table(ui, &indices);
-                }
-                ViewMode::DiskMap => {
-                    self.render_disk_map(ui, &indices);
-                }
-            }
+            self.render_table(ui, &indices);
         });
 
         if let Some(mut modal) = self.cleanup_modal.take() {
@@ -744,7 +698,22 @@ impl eframe::App for BcuApp {
                         let id = modal.app_names.first().map(|s| s.as_str()).unwrap_or("cleanup");
                         Some(clean_registry_remnants_selective(&remnants, true, None, id))
                     };
-                    self.status_text = format_cleanup_status(disk_cleaned, &disk_errors, reg_res);
+                    let reg_backup_path = reg_res.as_ref().and_then(|r| r.as_ref().ok()).map(|(p, _, _)| p.as_path());
+                    let reg_cleaned = reg_res.as_ref().and_then(|r| r.as_ref().ok()).map(|(_, c, _)| *c).unwrap_or(0);
+                    let mut all_errors = disk_errors.clone();
+                    if let Some(Ok((_, _, ref reg_errs))) = reg_res {
+                        all_errors.extend(reg_errs.iter().cloned());
+                    }
+                    let summary = build_cleanup_summary(
+                        &modal.app_names,
+                        &junk,
+                        &remnants,
+                        disk_cleaned,
+                        &all_errors,
+                        reg_cleaned,
+                    );
+                    let zip_path = RegBackup::create_desktop_backup_zip(reg_backup_path, &summary).ok();
+                    self.status_text = format_cleanup_status(disk_cleaned, &disk_errors, reg_res, zip_path);
                 }
                 Some(CleanupAction::Skip) => {
                     self.status_text = "Skipped post-uninstall leftover cleanup.".into();
@@ -756,19 +725,19 @@ impl eframe::App for BcuApp {
         }
         if let Some(confirm) = self.pending_confirm.take() {
             let mut keep_open = true;
-            egui::Window::new("⚠️ Confirmation")
+            egui::Window::new("Confirmation")
                 .collapsible(false)
                 .resizable(false)
                 .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
                 .show(ctx, |ui| {
                     match &confirm {
-                        ConfirmAction::BatchUninstall { targets, .. } => {
+                        ConfirmAction::BatchUninstall { targets } => {
                             ui.label(format!(
                                 "Selection includes protected (NoRemove) app(s). Uninstall {} app(s)?",
                                 targets.len()
                             ));
                         }
-                        ConfirmAction::ForceUninstall { app, .. } => {
+                        ConfirmAction::ForceUninstall { app } => {
                             ui.label(format!(
                                 "Force-remove '{}' from the Uninstall registry and scan leftovers?",
                                 app.display_name
@@ -780,24 +749,13 @@ impl eframe::App for BcuApp {
                                 );
                             }
                         }
-                        ConfirmAction::RestorePointFailed { error, .. } => {
-                            ui.colored_label(
-                                Color32::from_rgb(231, 76, 60),
-                                format!("System Restore Point failed: {}", error),
-                            );
-                            ui.label("Continue uninstalling without a Restore Point?");
-                        }
                     }
 
                     ui.separator();
                     ui.horizontal(|ui| {
                         if ui.button("Continue").clicked() {
                             keep_open = false;
-                            let next = match confirm.clone() {
-                                ConfirmAction::RestorePointFailed { next, .. } => *next,
-                                other => other,
-                            };
-                            self.execute_confirm_action(next);
+                            self.execute_confirm_action(confirm.clone());
                         }
                         if ui.button("Cancel").clicked() {
                             keep_open = false;
@@ -814,54 +772,27 @@ impl eframe::App for BcuApp {
 
 impl BcuApp {
     fn execute_confirm_action(&mut self, action: ConfirmAction) {
-        let needs_rp = self.create_restore_point
-            && matches!(
-                action,
-                ConfirmAction::BatchUninstall {
-                    skip_restore_point: false,
-                    ..
-                } | ConfirmAction::ForceUninstall {
-                    skip_restore_point: false,
-                    ..
-                }
-            );
-
-        if needs_rp {
-            let next = match action {
-                ConfirmAction::BatchUninstall { targets, .. } => ConfirmAction::BatchUninstall {
-                    targets,
-                    skip_restore_point: true,
-                },
-                ConfirmAction::ForceUninstall { app, .. } => ConfirmAction::ForceUninstall {
-                    app,
-                    skip_restore_point: true,
-                },
-                other => other,
-            };
-            let sender = self.sender.clone();
-            self.is_scanning = true;
-            self.status_text = "Creating System Restore Point...".into();
-            thread::spawn(move || {
-                let res = create_system_restore_point();
-                let _ = sender.send(AppEvent::RestorePointResult { res, next });
-            });
-            return;
-        }
-
         match action {
-            ConfirmAction::BatchUninstall { targets, .. } => {
+            ConfirmAction::BatchUninstall { targets } => {
                 self.start_batch_uninstall(targets);
             }
-            ConfirmAction::ForceUninstall { app, .. } => {
+            ConfirmAction::ForceUninstall { app } => {
                 match force_remove_uninstall_entry(&app, None) {
                     Ok(backup_path) => {
+                        let summary = format!(
+                            "Force Uninstall: {}\r\nRegistry backup: {}\r\n",
+                            app.display_name,
+                            backup_path.display()
+                        );
+                        let zip_path = RegBackup::create_desktop_backup_zip(Some(&backup_path), &summary)
+                            .unwrap_or(backup_path);
                         self.clear_selection_and_details();
                         self.apps = rescan_all(self.include_store);
                         self.recompute_filtered_indices();
                         self.status_text = format!(
                             "Force-removed '{}'. Backup: {}",
                             app.display_name,
-                            backup_path.display()
+                            zip_path.display()
                         );
                         self.start_post_uninstall_scan(vec![app]);
                     }
@@ -870,14 +801,10 @@ impl BcuApp {
                     }
                 }
             }
-            ConfirmAction::RestorePointFailed { next, .. } => {
-                self.execute_confirm_action(*next);
-            }
         }
     }
 
     fn start_batch_uninstall(&mut self, targets: Vec<ApplicationEntry>) {
-        let auto_click = self.auto_click_helper;
         let include_store = self.include_store;
         let sender = self.sender.clone();
         let queued = targets.len();
@@ -909,7 +836,7 @@ impl BcuApp {
                     let worker_tx = tx.clone();
 
                     thread::spawn(move || {
-                        let res = run_uninstall_and_wait(&cmd, auto_click);
+                        let res = run_uninstall_and_wait(&cmd);
                         let _ = worker_tx.send((id, name, res));
                     });
                 }
@@ -971,8 +898,8 @@ impl BcuApp {
 
                 header.col(|ui| {
                     let name_label = match self.sort_option {
-                        SortOption::NameAsc => "Display Name 🔼",
-                        SortOption::NameDesc => "Display Name 🔽",
+                        SortOption::NameAsc => "Display Name ^",
+                        SortOption::NameDesc => "Display Name v",
                         _ => "Display Name",
                     };
                     if ui.selectable_label(matches!(self.sort_option, SortOption::NameAsc | SortOption::NameDesc), name_label).clicked() {
@@ -986,8 +913,8 @@ impl BcuApp {
 
                 header.col(|ui| {
                     let size_label = match self.sort_option {
-                        SortOption::SizeDesc => "Size 🔽",
-                        SortOption::SizeAsc => "Size 🔼",
+                        SortOption::SizeDesc => "Size v",
+                        SortOption::SizeAsc => "Size ^",
                         _ => "Size",
                     };
                     if ui.selectable_label(matches!(self.sort_option, SortOption::SizeDesc | SortOption::SizeAsc), size_label).clicked() {
@@ -1086,56 +1013,68 @@ impl BcuApp {
             self.registry_remnants.clear();
         }
     }
+}
 
-    fn render_disk_map(&mut self, ui: &mut egui::Ui, indices: &[usize]) {
-        const PALETTE: &[Color32] = &[
-            Color32::from_rgb(52, 152, 219),
-            Color32::from_rgb(46, 204, 113),
-            Color32::from_rgb(155, 89, 182),
-            Color32::from_rgb(230, 126, 34),
-            Color32::from_rgb(26, 188, 156),
-            Color32::from_rgb(231, 76, 60),
-        ];
-
-        let items: Vec<TreeMapItem> = indices
-            .iter()
-            .enumerate()
-            .filter_map(|(pos, &orig_idx)| {
-                let app = self.apps.get(orig_idx)?;
-                Some(TreeMapItem {
-                    original_index: orig_idx,
-                    label: app.display_name.clone(),
-                    sublabel: app.publisher.clone().unwrap_or_default(),
-                    size_bytes: app.estimated_size_bytes.unwrap_or(0),
-                    color: PALETTE[pos % PALETTE.len()],
-                })
-            })
-            .collect();
-
-        let bounds = ui.available_rect_before_wrap();
-        let tiles = SquarifiedTreeMap::compute_layout(&items, bounds);
-        if let Some(clicked_idx) = render_treemap(ui, &tiles, self.selected_index) {
-            self.selected_index = Some(clicked_idx);
-            self.junk_items.clear();
-            self.registry_remnants.clear();
+fn build_cleanup_summary(
+    app_names: &[String],
+    junk: &[JunkItem],
+    remnants: &[RegistryRemnant],
+    disk_cleaned: usize,
+    errors: &[String],
+    reg_cleaned: usize,
+) -> String {
+    let mut out = format!(
+        "RustUninstaller Cleanup Backup\r\nApps: {}\r\nDisk recycled: {}\r\nRegistry cleaned: {}\r\n\r\n",
+        if app_names.is_empty() { "Selected".into() } else { app_names.join(", ") },
+        disk_cleaned,
+        reg_cleaned
+    );
+    if !junk.is_empty() {
+        out.push_str("Disk items:\r\n");
+        for j in junk {
+            out.push_str(&format!("- {}\r\n", j.path.display()));
+        }
+        out.push_str("\r\n");
+    }
+    if !remnants.is_empty() {
+        out.push_str("Registry remnants:\r\n");
+        for r in remnants {
+            let target = match &r.value_name {
+                Some(vn) => format!(r"{}\{} -> {}", r.hive, r.subkey, vn),
+                None => format!(r"{}\{}", r.hive, r.subkey),
+            };
+            out.push_str(&format!("- {}\r\n", target));
+        }
+        out.push_str("\r\n");
+    }
+    if !errors.is_empty() {
+        out.push_str("Errors:\r\n");
+        for e in errors {
+            out.push_str(&format!("- {}\r\n", e));
         }
     }
+    out
 }
 
 fn format_cleanup_status(
     disk_cleaned: usize,
     disk_errors: &[String],
-    reg_res: Option<std::io::Result<(std::path::PathBuf, usize, Vec<String>)>>,
+    reg_res: Option<std::io::Result<(PathBuf, usize, Vec<String>)>>,
+    zip_backup_path: Option<PathBuf>,
 ) -> String {
     let mut parts = vec![format!("recycled {} disk item(s)", disk_cleaned)];
     let mut err_count = disk_errors.len();
-    let mut backup_note = String::new();
+    let mut backup_note = zip_backup_path
+        .map(|zp| format!(" Backup: {}", zp.display()))
+        .unwrap_or_default();
 
     match reg_res {
         Some(Ok((backup_path, reg_cleaned, reg_errors))) => {
             parts.push(format!("cleaned {} registry remnant(s)", reg_cleaned));
             err_count += reg_errors.len();
-            backup_note = format!(" Backup: {}", backup_path.display());
+            if backup_note.is_empty() {
+                backup_note = format!(" Backup: {}", backup_path.display());
+            }
         }
         Some(Err(e)) => {
             err_count += 1;
@@ -1167,10 +1106,7 @@ fn matches_install_dir(install_location: Option<&std::path::Path>, target_dir: &
 
 fn format_size(bytes: Option<u64>) -> String {
     match bytes {
-        Some(b) if b >= 1024 * 1024 * 1024 => format!("{:.2} GB", b as f64 / (1024.0 * 1024.0 * 1024.0)),
-        Some(b) if b >= 1024 * 1024 => format!("{:.1} MB", b as f64 / (1024.0 * 1024.0)),
-        Some(b) if b >= 1024 => format!("{} KB", b / 1024),
-        Some(b) if b > 0 => format!("{} B", b),
+        Some(b) if b > 0 => format_bytes(b),
         _ => "-".to_string(),
     }
 }
@@ -1196,28 +1132,6 @@ fn is_uninstaller_missing(app: &ApplicationEntry) -> bool {
     (exe.contains('\\') || exe.contains('/')) && !std::path::Path::new(&exe).exists()
 }
 
-fn create_system_restore_point() -> Result<(), String> {
-    let output = Command::new("PowerShell.exe")
-        .args([
-            "-NonInteractive",
-            "-NoProfile",
-            "-Command",
-            "Checkpoint-Computer -Description 'RustUninstaller' -RestorePointType 'APPLICATION_UNINSTALL'",
-        ])
-        .output()
-        .map_err(|e| e.to_string())?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        Err(if stderr.is_empty() {
-            format!("Exit code {} (Run as Administrator)", output.status)
-        } else {
-            stderr
-        })
-    }
-}
-
 fn filter_removed_targets(
     launched: Vec<ApplicationEntry>,
     current_apps: &[ApplicationEntry],
@@ -1232,9 +1146,8 @@ fn filter_removed_targets(
         .collect()
 }
 
-fn run_uninstall_and_wait(cmd: &str, auto_click: bool) -> std::io::Result<()> {
+fn run_uninstall_and_wait(cmd: &str) -> std::io::Result<()> {
     let mut child = launch_uninstall_command(cmd)?;
-    let pid = child.id();
     loop {
         if let Some(status) = child.try_wait()? {
             if status.success() {
@@ -1244,9 +1157,6 @@ fn run_uninstall_and_wait(cmd: &str, auto_click: bool) -> std::io::Result<()> {
                 "Uninstaller exited with status {}",
                 status
             )));
-        }
-        if auto_click {
-            let _ = run_automation_cycle(pid);
         }
         thread::sleep(Duration::from_millis(500));
     }
@@ -1345,11 +1255,12 @@ mod tests {
         let msg = format_cleanup_status(
             1,
             &["Access denied".into()],
-            Some(Ok((std::path::PathBuf::from(r"C:\backup.reg"), 0, vec!["HKLM err".into()]))),
+            Some(Ok((PathBuf::from(r"C:\backup.reg"), 0, vec!["HKLM err".into()]))),
+            Some(PathBuf::from(r"C:\Users\Admin\Desktop\backup(2026-11-28_16-10-00).zip")),
         );
         assert!(msg.contains("failed"));
         assert!(msg.contains("Run as Administrator"));
-        assert!(msg.contains("backup.reg"));
+        assert!(msg.contains("backup(2026-11-28_16-10-00).zip"));
     }
 }
 

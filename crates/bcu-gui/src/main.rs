@@ -2,7 +2,6 @@
 
 mod app;
 mod cleanup_modal;
-pub mod treemap;
 
 use app::BcuApp;
 use eframe::egui;
