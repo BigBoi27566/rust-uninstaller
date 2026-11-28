@@ -1,4 +1,6 @@
-use bcu_core::heuristics::{detect_uninstaller_kind, parse_command_line, synthesize_quiet_command};
+use bcu_core::heuristics::{
+    detect_uninstaller_kind, matches_app_name, parse_command_line, synthesize_quiet_command,
+};
 use bcu_core::models::UninstallerKind;
 
 #[test]
@@ -52,4 +54,15 @@ fn test_parse_command_line() {
 
     // Empty
     assert!(parse_command_line("   ").is_none());
+}
+
+#[test]
+fn test_matches_app_name_word_boundaries() {
+    assert!(matches_app_name("Git", "Git"));
+    assert!(matches_app_name("Git for Windows", "Git"));
+    assert!(matches_app_name("MyCoolApp Tools", "MyCoolApp"));
+    assert!(!matches_app_name("Logitech", "Git"));
+    assert!(!matches_app_name("GitHub", "Git"));
+    assert!(matches_app_name("Go", "Go"));
+    assert!(!matches_app_name("Google Chrome", "Go"));
 }

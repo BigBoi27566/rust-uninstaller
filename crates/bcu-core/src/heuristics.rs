@@ -127,3 +127,32 @@ pub fn parse_command_line(cmd: &str) -> Option<(String, Vec<String>)> {
     Some((exe, args))
 }
 
+/// Matches `app_name` against `candidate` using exact match or word-boundary match (>= 3 chars)
+/// so short names like "Git" do not match unrelated names like "Logitech".
+pub fn matches_app_name(candidate: &str, app_name: &str) -> bool {
+    let cand = candidate.trim().to_lowercase();
+    let target = app_name.trim().to_lowercase();
+    if target.is_empty() || cand.is_empty() {
+        return false;
+    }
+    if cand == target {
+        return true;
+    }
+    if target.chars().count() < 3 {
+        return false;
+    }
+
+    cand.match_indices(&target).any(|(start, _)| {
+        let left_ok = cand[..start]
+            .chars()
+            .next_back()
+            .map_or(true, |c| !c.is_alphanumeric());
+        let end = start + target.len();
+        let right_ok = cand[end..]
+            .chars()
+            .next()
+            .map_or(true, |c| !c.is_alphanumeric());
+        left_ok && right_ok
+    })
+}
+

@@ -2,6 +2,7 @@ use bcu_core::automation::run_automation_cycle;
 use bcu_core::export::export_to_csv;
 use bcu_core::junk::scan_disk_junk;
 use bcu_core::models::{ApplicationEntry, ConfidenceLevel, JunkItem};
+use bcu_core::queue::{TaskStatus, UninstallQueue};
 use bcu_core::recycle::clean_junk_items;
 use bcu_core::registry::scan_registry_uninstallers;
 use bcu_core::registry_deep::{clean_registry_remnants, scan_deep_registry, RegistryRemnant};
@@ -49,6 +50,10 @@ pub enum SortOption {
 
 pub enum AppEvent {
     AppsLoaded(Vec<ApplicationEntry>),
+    BatchFinished {
+        apps: Vec<ApplicationEntry>,
+        status: String,
+    },
     JunkLoaded(Vec<JunkItem>),
     RegistryLoaded(Vec<RegistryRemnant>),
 }
@@ -122,11 +127,7 @@ impl BcuApp {
         let include_store = self.include_store;
 
         thread::spawn(move || {
-            let mut list = scan_registry_uninstallers();
-            if include_store {
-                list.extend(scan_store_apps());
-            }
-            let _ = tx.send(AppEvent::AppsLoaded(list));
+            let _ = tx.send(AppEvent::AppsLoaded(rescan_all(include_store)));
         });
     }
 
@@ -237,6 +238,11 @@ impl BcuApp {
                     self.is_scanning = false;
                     self.status_text = format!("Ready: {} applications loaded.", self.apps.len());
                 }
+                AppEvent::BatchFinished { apps, status } => {
+                    self.apps = apps;
+                    self.is_scanning = false;
+                    self.status_text = status;
+                }
                 AppEvent::JunkLoaded(items) => {
                     self.junk_items = items;
                     self.is_scanning_junk = false;
@@ -335,50 +341,17 @@ impl eframe::App for BcuApp {
                     show_fade_tooltip(ui, &uninstall_btn, "Launch silent uninstaller for checked programs");
                     if uninstall_btn.clicked() {
                         let auto_click = self.auto_click_helper;
-                        let mut launched = 0;
+                        let include_store = self.include_store;
+                        let sender = self.sender.clone();
+                        let mut queue = UninstallQueue::new();
                         let mut errors = Vec::new();
+                        let mut queued = 0usize;
 
                         for &idx in &self.checked_indices {
-                            if let Some(app) = self.apps.get(idx) {
-                                // Prefer quiet command if available, otherwise fall back to normal uninstall string
-                                let cmd_to_run = app.quiet_uninstall_string.as_deref()
-                                    .or(app.uninstall_string.as_deref());
-
-                                if let Some(raw_cmd) = cmd_to_run {
-                                    match launch_uninstall_command(raw_cmd) {
-                                        Ok(mut child) => {
-                                            launched += 1;
-                                            let sender = self.sender.clone();
-                                            let include_store = self.include_store;
-                                            let pid = child.id();
-
-                                            thread::spawn(move || {
-                                                if auto_click {
-                                                    let auto_thread = thread::spawn(move || {
-                                                        for _ in 0..15 {
-                                                            thread::sleep(Duration::from_millis(800));
-                                                            let _ = run_automation_cycle(pid);
-                                                        }
-                                                    });
-                                                    let _ = child.wait();
-                                                    let _ = auto_thread.join();
-                                                } else {
-                                                    let _ = child.wait();
-                                                }
-
-                                                // Brief delay to ensure Windows Registry flush
-                                                thread::sleep(Duration::from_millis(600));
-                                                let mut apps = scan_registry_uninstallers();
-                                                if include_store {
-                                                    apps.extend(scan_store_apps());
-                                                }
-                                                let _ = sender.send(AppEvent::AppsLoaded(apps));
-                                            });
-                                        }
-                                        Err(e) => {
-                                            errors.push(format!("{}: {}", app.display_name, e));
-                                        }
-                                    }
+                            if let Some(app) = self.apps.get(idx).cloned() {
+                                if app.quiet_uninstall_string.is_some() || app.uninstall_string.is_some() {
+                                    queue.add(app);
+                                    queued += 1;
                                 } else {
                                     errors.push(format!("{}: No uninstall command found", app.display_name));
                                 }
@@ -388,12 +361,61 @@ impl eframe::App for BcuApp {
                         self.checked_indices.clear();
                         self.selected_index = None;
 
-                        if errors.is_empty() {
-                            self.status_text = format!("Uninstalling {} app(s)... list will refresh automatically.", launched);
-                        } else if launched > 0 {
-                            self.status_text = format!("Uninstalling {} app(s)... Errors: {}", launched, errors.join("; "));
-                        } else {
+                        if queued == 0 {
                             self.status_text = format!("Failed to launch uninstaller: {}", errors.join("; "));
+                        } else {
+                            self.is_scanning = true;
+                            self.status_text = format!("Queued {} app(s) for uninstall...", queued);
+
+                            thread::spawn(move || {
+                                let (tx, rx) = channel::<(String, String, std::io::Result<()>)>();
+                                let mut in_flight = 0usize;
+
+                                loop {
+                                    while let Some(task) = queue.next_runnable_task().cloned() {
+                                        let id = task.app.id.clone();
+                                        let name = task.app.display_name.clone();
+                                        let cmd = task
+                                            .app
+                                            .quiet_uninstall_string
+                                            .or(task.app.uninstall_string)
+                                            .unwrap_or_default();
+
+                                        queue.set_status(&id, TaskStatus::Running);
+                                        in_flight += 1;
+                                        let worker_tx = tx.clone();
+
+                                        thread::spawn(move || {
+                                            let res = run_uninstall_and_wait(&cmd, auto_click);
+                                            let _ = worker_tx.send((id, name, res));
+                                        });
+                                    }
+
+                                    if in_flight == 0 {
+                                        break;
+                                    }
+
+                                    if let Ok((done_id, name, res)) = rx.recv() {
+                                        in_flight -= 1;
+                                        match res {
+                                            Ok(()) => queue.set_status(&done_id, TaskStatus::Completed),
+                                            Err(e) => {
+                                                queue.set_status(&done_id, TaskStatus::Failed);
+                                                errors.push(format!("{}: {}", name, e));
+                                            }
+                                        }
+                                    }
+                                }
+
+                                thread::sleep(Duration::from_millis(600));
+                                let apps = rescan_all(include_store);
+                                let status = if errors.is_empty() {
+                                    format!("Finished uninstalling {} app(s). {} apps remaining.", queued, apps.len())
+                                } else {
+                                    format!("Uninstall finished with errors: {}", errors.join("; "))
+                                };
+                                let _ = sender.send(AppEvent::BatchFinished { apps, status });
+                            });
                         }
                     }
                 }
@@ -418,20 +440,24 @@ impl eframe::App for BcuApp {
                             let quiet_btn = ui.button("⚡ Run Quiet Uninstall");
                             show_fade_tooltip(ui, &quiet_btn, "Run vendor uninstaller in silent/unattended mode");
                             if quiet_btn.clicked() {
-                                let parts: Vec<&str> = quiet.split_whitespace().collect();
-                                if !parts.is_empty() {
-                                    if let Ok(child) = Command::new(parts[0]).args(&parts[1..]).spawn() {
-                                        if self.auto_click_helper {
-                                            let pid = child.id();
-                                            thread::spawn(move || {
-                                                for _ in 0..15 {
-                                                    thread::sleep(Duration::from_millis(800));
-                                                    let _ = run_automation_cycle(pid);
-                                                }
-                                            });
-                                        }
-                                    }
-                                }
+                                let cmd = quiet.clone();
+                                let name = app.display_name.clone();
+                                let auto_click = self.auto_click_helper;
+                                let include_store = self.include_store;
+                                let sender = self.sender.clone();
+                                self.is_scanning = true;
+                                self.status_text = format!("Running quiet uninstall for '{}'...", name);
+
+                                thread::spawn(move || {
+                                    let res = run_uninstall_and_wait(&cmd, auto_click);
+                                    thread::sleep(Duration::from_millis(600));
+                                    let apps = rescan_all(include_store);
+                                    let status = match res {
+                                        Ok(()) => format!("Finished uninstalling '{}'. {} apps remaining.", name, apps.len()),
+                                        Err(e) => format!("Failed to uninstall '{}': {}", name, e),
+                                    };
+                                    let _ = sender.send(AppEvent::BatchFinished { apps, status });
+                                });
                             }
                         }
 
@@ -467,13 +493,24 @@ impl eframe::App for BcuApp {
                             show_fade_tooltip(ui, &clean_reg_btn, "Export rollback backup .reg before cleaning remnants");
                             if clean_reg_btn.clicked() {
                                 match clean_registry_remnants(&self.registry_remnants, None, &app.id) {
-                                    Ok(backup_path) => {
-                                        self.status_text = format!(
-                                            "Cleaned {} registry remnant(s)! Backup: {}",
-                                            self.registry_remnants.len(),
-                                            backup_path.display()
-                                        );
-                                        self.registry_remnants.clear();
+                                    Ok((backup_path, deleted, errors)) => {
+                                        self.status_text = if errors.is_empty() {
+                                            format!(
+                                                "Cleaned {} registry remnant(s)! Backup: {}",
+                                                deleted,
+                                                backup_path.display()
+                                            )
+                                        } else {
+                                            format!(
+                                                "Cleaned {} remnant(s), {} failed (try Run as Administrator). Backup: {}",
+                                                deleted,
+                                                errors.len(),
+                                                backup_path.display()
+                                            )
+                                        };
+                                        if deleted > 0 {
+                                            self.registry_remnants.clear();
+                                        }
                                     }
                                     Err(err) => {
                                         self.status_text = format!("Error cleaning registry: {}", err);
@@ -731,6 +768,26 @@ fn format_size(bytes: Option<u64>) -> String {
         Some(b) if b > 0 => format!("{} B", b),
         _ => "-".to_string(),
     }
+}
+
+fn rescan_all(include_store: bool) -> Vec<ApplicationEntry> {
+    let mut apps = scan_registry_uninstallers();
+    if include_store {
+        apps.extend(scan_store_apps());
+    }
+    apps
+}
+
+fn run_uninstall_and_wait(cmd: &str, auto_click: bool) -> std::io::Result<()> {
+    let mut child = launch_uninstall_command(cmd)?;
+    let pid = child.id();
+    while child.try_wait()?.is_none() {
+        if auto_click {
+            let _ = run_automation_cycle(pid);
+        }
+        thread::sleep(Duration::from_millis(500));
+    }
+    Ok(())
 }
 
 fn launch_uninstall_command(cmd: &str) -> std::io::Result<Child> {

@@ -123,10 +123,9 @@ fn scan_muicache(
         for (name, val) in key.enum_values().filter_map(|r| r.ok()) {
             let name_lower = name.to_lowercase();
             let val_str = val.to_string();
-            let val_lower = val_str.to_lowercase();
 
             let matches_loc = !loc_lower.is_empty() && name_lower.contains(loc_lower);
-            let matches_app = val_lower.contains(app_lower);
+            let matches_app = crate::heuristics::matches_app_name(&val_str, app_lower);
             let matches_bin = binary_names
                 .iter()
                 .any(|&bin| !bin.is_empty() && name_lower.contains(&bin.to_lowercase()));
@@ -166,11 +165,10 @@ fn scan_startup_keys(
         let root = RegKey::predef(hive_code);
         if let Ok(key) = root.open_subkey_with_flags(sub_path, sam) {
             for (val_name, val_data) in key.enum_values().filter_map(|r| r.ok()) {
-                let name_lower = val_name.to_lowercase();
                 let data_str = val_data.to_string();
                 let data_lower = data_str.to_lowercase();
 
-                let matches_name = name_lower.contains(app_lower);
+                let matches_name = crate::heuristics::matches_app_name(&val_name, app_lower);
                 let matches_loc = !loc_lower.is_empty() && data_lower.contains(loc_lower);
                 let matches_bin = binary_names
                     .iter()
@@ -211,7 +209,7 @@ fn scan_startup_keys(
 
 fn scan_software_keys(
     app_lower: &str,
-    _app_name: &str,
+    app_name: &str,
     publisher: Option<&str>,
     remnants: &mut Vec<RegistryRemnant>,
 ) {
@@ -235,7 +233,8 @@ fn scan_software_keys(
                     continue;
                 }
 
-                if sub_lower == app_lower || sub_lower.contains(app_lower) {
+                let is_exact = sub_lower == app_lower;
+                if is_exact || crate::heuristics::matches_app_name(&sub, app_name) {
                     let full_subkey = format!(r"{}\{}", base_path, sub);
                     remnants.push(RegistryRemnant {
                         hive: hive_name.to_string(),
@@ -243,7 +242,11 @@ fn scan_software_keys(
                         value_name: None,
                         value_data: None,
                         remnant_type: RegistryRemnantType::AppSoftwareKey,
-                        confidence: ConfidenceLevel::Safe,
+                        confidence: if is_exact {
+                            ConfidenceLevel::Safe
+                        } else {
+                            ConfidenceLevel::Questionable
+                        },
                         reason: format!("Dedicated application registry key under {}", base_path),
                     });
                 }
@@ -255,7 +258,8 @@ fn scan_software_keys(
                 if let Ok(pub_key) = root.open_subkey_with_flags(&pub_path, KEY_READ) {
                     for sub in pub_key.enum_keys().filter_map(|r| r.ok()) {
                         let sub_lower = sub.to_lowercase();
-                        if sub_lower == app_lower || sub_lower.contains(app_lower) {
+                        let is_exact = sub_lower == app_lower;
+                        if is_exact || crate::heuristics::matches_app_name(&sub, app_name) {
                             let full_subkey = format!(r"{}\{}\{}", base_path, pub_name, sub);
                             remnants.push(RegistryRemnant {
                                 hive: hive_name.to_string(),
@@ -263,7 +267,11 @@ fn scan_software_keys(
                                 value_name: None,
                                 value_data: None,
                                 remnant_type: RegistryRemnantType::AppSoftwareKey,
-                                confidence: ConfidenceLevel::Safe,
+                                confidence: if is_exact {
+                                    ConfidenceLevel::Safe
+                                } else {
+                                    ConfidenceLevel::Questionable
+                                },
                                 reason: format!("Application registry key under publisher {}", pub_name),
                             });
                         }
@@ -274,17 +282,68 @@ fn scan_software_keys(
     }
 }
 
-/// Safely cleans remnants after generating an automatic rollback `.reg` backup file.
-/// Returns the PathBuf of the generated `.reg` backup.
+fn parse_hive(hive: &str) -> Option<winreg::HKEY> {
+    match hive {
+        "HKEY_LOCAL_MACHINE" => Some(HKEY_LOCAL_MACHINE),
+        "HKEY_CURRENT_USER" => Some(HKEY_CURRENT_USER),
+        "HKEY_CLASSES_ROOT" => Some(HKEY_CLASSES_ROOT),
+        _ => None,
+    }
+}
+
+fn decode_utf16_le(bytes: &[u8]) -> Vec<u16> {
+    bytes
+        .chunks_exact(2)
+        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .collect()
+}
+
+fn raw_to_backup_data(raw: winreg::RegValue) -> RegValueData {
+    use winreg::enums::RegType::*;
+    match raw.vtype {
+        REG_SZ | REG_EXPAND_SZ => {
+            let units = decode_utf16_le(&raw.bytes);
+            let end = units.iter().position(|&u| u == 0).unwrap_or(units.len());
+            let text = String::from_utf16_lossy(&units[..end]);
+            if matches!(raw.vtype, REG_EXPAND_SZ) {
+                RegValueData::ExpandString(text)
+            } else {
+                RegValueData::String(text)
+            }
+        }
+        REG_DWORD if raw.bytes.len() == 4 => RegValueData::Dword(u32::from_le_bytes([
+            raw.bytes[0],
+            raw.bytes[1],
+            raw.bytes[2],
+            raw.bytes[3],
+        ])),
+        REG_QWORD if raw.bytes.len() == 8 => {
+            RegValueData::Qword(u64::from_le_bytes(raw.bytes[..8].try_into().unwrap()))
+        }
+        REG_MULTI_SZ => {
+            let units = decode_utf16_le(&raw.bytes);
+            let items = units
+                .split(|&u| u == 0)
+                .take_while(|slice| !slice.is_empty())
+                .map(String::from_utf16_lossy)
+                .collect();
+            RegValueData::MultiString(items)
+        }
+        REG_NONE => RegValueData::None,
+        _ => RegValueData::Binary(raw.bytes),
+    }
+}
+
+/// Safely cleans safe remnants after generating an automatic rollback `.reg` backup file.
+/// Returns `(backup_path, deleted_count, errors)`.
 pub fn clean_registry_remnants(
     remnants: &[RegistryRemnant],
     backup_dir: Option<&Path>,
     app_id: &str,
-) -> std::io::Result<PathBuf> {
-    // 1. Filter out Dangerous items
+) -> std::io::Result<(PathBuf, usize, Vec<String>)> {
     let safe_remnants: Vec<&RegistryRemnant> = remnants
         .iter()
-        .filter(|r| r.confidence != ConfidenceLevel::Dangerous)
+        .filter(|r| r.confidence == ConfidenceLevel::Safe)
         .collect();
 
     if safe_remnants.is_empty() {
@@ -294,14 +353,11 @@ pub fn clean_registry_remnants(
         ));
     }
 
-    // 2. Generate Rollback RegBackup
+    // Generate Rollback RegBackup preserving original value types
     let mut backup = RegBackup::new();
     for rem in &safe_remnants {
-        let hive_code = match rem.hive.as_str() {
-            "HKEY_LOCAL_MACHINE" => HKEY_LOCAL_MACHINE,
-            "HKEY_CURRENT_USER" => HKEY_CURRENT_USER,
-            "HKEY_CLASSES_ROOT" => HKEY_CLASSES_ROOT,
-            _ => continue,
+        let Some(hive_code) = parse_hive(&rem.hive) else {
+            continue;
         };
 
         let root = RegKey::predef(hive_code);
@@ -309,9 +365,8 @@ pub fn clean_registry_remnants(
 
         if let Ok(key) = root.open_subkey_with_flags(&rem.subkey, KEY_READ) {
             if let Some(ref val_name) = rem.value_name {
-                // Back up single value
                 let val_data = match key.get_raw_value(val_name) {
-                    Ok(raw) => RegValueData::Binary(raw.bytes),
+                    Ok(raw) => raw_to_backup_data(raw),
                     Err(_) => RegValueData::None,
                 };
                 backup.add_key(&key_path, vec![RegValueBackup {
@@ -319,13 +374,12 @@ pub fn clean_registry_remnants(
                     data: val_data,
                 }]);
             } else {
-                // Back up entire key and all its values
                 let mut values = Vec::new();
                 for (vname, _) in key.enum_values().filter_map(|r| r.ok()) {
                     if let Ok(raw) = key.get_raw_value(&vname) {
                         values.push(RegValueBackup {
                             name: vname,
-                            data: RegValueData::Binary(raw.bytes),
+                            data: raw_to_backup_data(raw),
                         });
                     }
                 }
@@ -334,7 +388,6 @@ pub fn clean_registry_remnants(
         }
     }
 
-    // 3. Save backup file to disk
     let backup_path = if let Some(dir) = backup_dir {
         let filename = RegBackup::generate_backup_path(app_id)
             .file_name()
@@ -348,27 +401,34 @@ pub fn clean_registry_remnants(
 
     backup.save_to_file(&backup_path)?;
 
-    // 4. Perform actual deletions
+    let mut deleted_count = 0usize;
+    let mut errors = Vec::new();
     for rem in safe_remnants {
-        let hive_code = match rem.hive.as_str() {
-            "HKEY_LOCAL_MACHINE" => HKEY_LOCAL_MACHINE,
-            "HKEY_CURRENT_USER" => HKEY_CURRENT_USER,
-            "HKEY_CLASSES_ROOT" => HKEY_CLASSES_ROOT,
-            _ => continue,
+        let Some(hive_code) = parse_hive(&rem.hive) else {
+            continue;
         };
 
         let root = RegKey::predef(hive_code);
-        if let Some(ref val_name) = rem.value_name {
-            if let Ok(key) = root.open_subkey_with_flags(&rem.subkey, KEY_WRITE) {
-                let _ = key.delete_value(val_name);
-            }
+        let target = if let Some(ref val_name) = rem.value_name {
+            format!(r"{}\{} -> {}", rem.hive, rem.subkey, val_name)
         } else {
-            // Delete entire subkey
-            let _ = root.delete_subkey_all(&rem.subkey);
+            format!(r"{}\{}", rem.hive, rem.subkey)
+        };
+
+        let res = if let Some(ref val_name) = rem.value_name {
+            root.open_subkey_with_flags(&rem.subkey, KEY_WRITE)
+                .and_then(|key| key.delete_value(val_name))
+        } else {
+            root.delete_subkey_all(&rem.subkey)
+        };
+
+        match res {
+            Ok(()) => deleted_count += 1,
+            Err(e) => errors.push(format!("{}: {}", target, e)),
         }
     }
 
-    Ok(backup_path)
+    Ok((backup_path, deleted_count, errors))
 }
 
 fn extract_filename(cmd: &str) -> Option<String> {
@@ -436,5 +496,25 @@ mod tests {
     fn test_scan_deep_registry_system_app_returns_empty() {
         let remnants = scan_deep_registry_for_target("Microsoft", None, None, &[]);
         assert!(remnants.is_empty(), "Protected system names must return zero remnants");
+    }
+
+    #[test]
+    fn test_raw_to_backup_data_preserves_types() {
+        let sz_bytes: Vec<u8> = "C:\\App\0".encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
+        assert_eq!(
+            raw_to_backup_data(winreg::RegValue {
+                bytes: sz_bytes,
+                vtype: RegType::REG_SZ,
+            }),
+            RegValueData::String("C:\\App".to_string())
+        );
+
+        assert_eq!(
+            raw_to_backup_data(winreg::RegValue {
+                bytes: 42u32.to_le_bytes().to_vec(),
+                vtype: RegType::REG_DWORD,
+            }),
+            RegValueData::Dword(42)
+        );
     }
 }

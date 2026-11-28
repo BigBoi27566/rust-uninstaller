@@ -243,10 +243,13 @@ fn cmd_clean_reg(app_name: &str, backup_dir: Option<&std::path::Path>) {
     }
 
     match clean_registry_remnants(&remnants, backup_dir, app_name) {
-        Ok(backup_file) => {
-            println!("\n[SUCCESS] Cleaned safe registry remnants!");
+        Ok((backup_file, deleted, errors)) => {
+            println!("\n[SUCCESS] Cleaned {} safe registry remnant(s)!", deleted);
             println!("Rollback backup created at: {}", backup_file.display());
             println!("(To undo this cleanup, simply double-click the .reg file)");
+            for err in errors {
+                eprintln!(" - Failed: {}", err);
+            }
         }
         Err(err) => {
             eprintln!("\n[ERROR] Failed to clean registry remnants: {}", err);

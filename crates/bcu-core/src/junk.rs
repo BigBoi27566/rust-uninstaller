@@ -87,10 +87,10 @@ pub fn scan_disk_junk(app_name: &str, known_install_dir: Option<&Path>) -> Vec<J
                 for entry in entries.filter_map(|e| e.ok()) {
                     let path = entry.path();
                     if path.is_dir() {
-                        let name = entry.file_name().to_string_lossy().to_lowercase();
-                        let target = trimmed_app.to_lowercase();
+                        let file_name = entry.file_name();
+                        let name = file_name.to_string_lossy();
 
-                        if name.contains(&target) {
+                        if crate::heuristics::matches_app_name(&name, trimmed_app) {
                             let confidence = evaluate_confidence(&path, trimmed_app, known_install_dir);
                             found.push(JunkItem {
                                 path: path.clone(),

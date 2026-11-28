@@ -67,7 +67,9 @@ impl UninstallQueue {
     }
 
     pub fn set_status(&mut self, app_id: &str, status: TaskStatus) {
-        if let Some(task) = self.tasks.iter_mut().find(|t| t.app.id == app_id) {
+        if let Some(task) = self.tasks.iter_mut().find(|t| {
+            t.app.id == app_id && !matches!(t.status, TaskStatus::Completed | TaskStatus::Failed)
+        }) {
             task.status = status;
         }
     }
