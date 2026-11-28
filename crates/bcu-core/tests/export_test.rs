@@ -16,6 +16,7 @@ fn test_export_csv_escapes_commas_and_quotes() {
         uninstaller_kind: UninstallerKind::InnoSetup,
         is_system_component: false,
         is_protected: false,
+        registry_location: None,
     };
 
     let csv = export_to_csv(&[app]);
@@ -39,6 +40,7 @@ fn test_export_json_valid_array() {
         uninstaller_kind: UninstallerKind::Unknown,
         is_system_component: false,
         is_protected: false,
+        registry_location: None,
     };
 
     let json = export_to_json(&[app]);

@@ -73,6 +73,7 @@ pub fn scan_store_apps() -> Vec<ApplicationEntry> {
             uninstaller_kind: UninstallerKind::StoreApp,
             is_system_component: false,
             is_protected: false,
+            registry_location: None,
         });
     }
 

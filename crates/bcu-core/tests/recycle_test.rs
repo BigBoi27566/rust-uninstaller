@@ -10,6 +10,7 @@ fn test_dangerous_junk_is_strictly_rejected() {
         is_registry: false,
         confidence: ConfidenceLevel::Dangerous,
         reason: "System root".into(),
+        size_bytes: None,
     };
 
     let (cleaned_count, errors) = clean_junk_items(&[dangerous_item], true);

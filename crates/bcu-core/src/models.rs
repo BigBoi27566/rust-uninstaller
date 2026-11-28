@@ -19,6 +19,19 @@ pub enum ConfidenceLevel {
     Dangerous,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RegistryHive {
+    Hklm64,
+    Hklm32,
+    Hkcu,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RegistryLocation {
+    pub hive: RegistryHive,
+    pub subkey_path: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApplicationEntry {
     pub id: String,
@@ -33,6 +46,8 @@ pub struct ApplicationEntry {
     pub uninstaller_kind: UninstallerKind,
     pub is_system_component: bool,
     pub is_protected: bool,
+    #[serde(default)]
+    pub registry_location: Option<RegistryLocation>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -41,4 +56,6 @@ pub struct JunkItem {
     pub is_registry: bool,
     pub confidence: ConfidenceLevel,
     pub reason: String,
+    #[serde(default)]
+    pub size_bytes: Option<u64>,
 }

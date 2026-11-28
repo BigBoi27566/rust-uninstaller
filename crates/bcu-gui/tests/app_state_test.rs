@@ -30,6 +30,7 @@ fn test_filter_applications_by_name_and_publisher() {
             uninstaller_kind: UninstallerKind::InnoSetup,
             is_system_component: false,
             is_protected: false,
+            registry_location: None,
         },
         ApplicationEntry {
             id: "2".into(),
@@ -44,6 +45,7 @@ fn test_filter_applications_by_name_and_publisher() {
             uninstaller_kind: UninstallerKind::InnoSetup,
             is_system_component: false,
             is_protected: false,
+            registry_location: None,
         },
     ];
 
@@ -75,6 +77,7 @@ fn test_sort_applications_by_name_and_size() {
             uninstaller_kind: UninstallerKind::Unknown,
             is_system_component: false,
             is_protected: false,
+            registry_location: None,
         },
         ApplicationEntry {
             id: "2".into(),
@@ -89,6 +92,7 @@ fn test_sort_applications_by_name_and_size() {
             uninstaller_kind: UninstallerKind::Unknown,
             is_system_component: false,
             is_protected: false,
+            registry_location: None,
         },
         ApplicationEntry {
             id: "3".into(),
@@ -103,6 +107,7 @@ fn test_sort_applications_by_name_and_size() {
             uninstaller_kind: UninstallerKind::Unknown,
             is_system_component: false,
             is_protected: false,
+            registry_location: None,
         },
     ];
 

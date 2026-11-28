@@ -15,6 +15,7 @@ fn test_application_entry_serialization() {
         uninstaller_kind: UninstallerKind::InnoSetup,
         is_system_component: false,
         is_protected: false,
+        registry_location: None,
     };
 
     let json = serde_json::to_string(&entry).expect("Must serialize to JSON");

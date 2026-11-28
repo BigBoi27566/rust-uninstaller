@@ -71,6 +71,30 @@ pub fn evaluate_confidence(
     ConfidenceLevel::Questionable
 }
 
+/// Recursively computes total file size in bytes, skipping symlinks/junctions to prevent cycles.
+pub fn dir_size_bytes(path: &Path) -> u64 {
+    let Ok(meta) = fs::symlink_metadata(path) else {
+        return 0;
+    };
+    if meta.file_type().is_symlink() {
+        return 0;
+    }
+    if meta.is_file() {
+        return meta.len();
+    }
+    if !meta.is_dir() {
+        return 0;
+    }
+
+    let Ok(entries) = fs::read_dir(path) else {
+        return 0;
+    };
+    entries
+        .filter_map(|e| e.ok())
+        .map(|entry| dir_size_bytes(&entry.path()))
+        .sum()
+}
+
 pub fn scan_disk_junk(app_name: &str, known_install_dir: Option<&Path>) -> Vec<JunkItem> {
     let trimmed_app = app_name.trim();
     if trimmed_app.is_empty() {
@@ -92,11 +116,17 @@ pub fn scan_disk_junk(app_name: &str, known_install_dir: Option<&Path>) -> Vec<J
 
                         if crate::heuristics::matches_app_name(&name, trimmed_app) {
                             let confidence = evaluate_confidence(&path, trimmed_app, known_install_dir);
+                            let size_bytes = if confidence == ConfidenceLevel::Dangerous {
+                                None
+                            } else {
+                                Some(dir_size_bytes(&path))
+                            };
                             found.push(JunkItem {
                                 path: path.clone(),
                                 is_registry: false,
                                 confidence,
                                 reason: format!("Directory matches application name '{}'", trimmed_app),
+                                size_bytes,
                             });
                         }
                     }

@@ -1,5 +1,6 @@
-use bcu_core::junk::{evaluate_confidence, scan_disk_junk};
+use bcu_core::junk::{dir_size_bytes, evaluate_confidence, scan_disk_junk};
 use bcu_core::models::ConfidenceLevel;
+use std::fs;
 use std::path::Path;
 
 #[test]
@@ -53,4 +54,19 @@ fn test_scan_disk_junk_runs_without_panic() {
     // Search for a non-existent or dummy software
     let junk = scan_disk_junk("NonExistentSoftware_12345XYZ", None);
     assert!(junk.is_empty(), "Should not find junk for non-existent software");
+}
+
+#[test]
+fn test_dir_size_bytes_calculates_files_and_skips_missing() {
+    let temp_dir = std::env::temp_dir().join("bcu_test_dir_size");
+    let _ = fs::remove_dir_all(&temp_dir);
+    let sub_dir = temp_dir.join("sub");
+    fs::create_dir_all(&sub_dir).unwrap();
+    fs::write(temp_dir.join("a.bin"), vec![0u8; 100]).unwrap();
+    fs::write(sub_dir.join("b.bin"), vec![0u8; 250]).unwrap();
+
+    assert_eq!(dir_size_bytes(&temp_dir), 350);
+    assert_eq!(dir_size_bytes(&temp_dir.join("missing")), 0);
+
+    let _ = fs::remove_dir_all(&temp_dir);
 }

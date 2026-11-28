@@ -1,4 +1,4 @@
-use crate::models::{ApplicationEntry, UninstallerKind};
+use crate::models::{ApplicationEntry, RegistryHive, RegistryLocation, UninstallerKind};
 use std::collections::HashSet;
 use std::path::PathBuf;
 use winreg::enums::*;
@@ -124,8 +124,16 @@ fn scan_hive(
                 .and_then(|cmd| crate::heuristics::synthesize_quiet_command(cmd, &uninstaller_kind))
         });
 
+        let hive = if root_hive == HKEY_CURRENT_USER {
+            RegistryHive::Hkcu
+        } else if (sam & KEY_WOW64_32KEY) != 0 {
+            RegistryHive::Hklm32
+        } else {
+            RegistryHive::Hklm64
+        };
+
         results.push(ApplicationEntry {
-            id: subkey_name,
+            id: subkey_name.clone(),
             display_name: trimmed_name.to_string(),
             display_version,
             publisher,
@@ -137,6 +145,10 @@ fn scan_hive(
             uninstaller_kind,
             is_system_component,
             is_protected,
+            registry_location: Some(RegistryLocation {
+                hive,
+                subkey_path: format!(r"{}\{}", sub_path, subkey_name),
+            }),
         });
     }
 }
