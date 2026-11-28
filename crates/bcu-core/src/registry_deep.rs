@@ -1,4 +1,4 @@
-use crate::models::{ApplicationEntry, ConfidenceLevel, RegistryHive, UninstallerKind};
+use crate::models::{ApplicationEntry, ConfidenceLevel, RegistryHive, RegistryLocation, UninstallerKind};
 use crate::reg_backup::{RegBackup, RegValueBackup, RegValueData};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -334,6 +334,45 @@ fn raw_to_backup_data(raw: winreg::RegValue) -> RegValueData {
     }
 }
 
+fn backup_key_path(loc: &RegistryLocation) -> String {
+    match loc.hive {
+        RegistryHive::Hkcu => format!(r"HKEY_CURRENT_USER\{}", loc.subkey_path),
+        RegistryHive::Hklm64 => format!(r"HKEY_LOCAL_MACHINE\{}", loc.subkey_path),
+        RegistryHive::Hklm32 => {
+            if let Some(rest) = loc
+                .subkey_path
+                .strip_prefix(r"SOFTWARE\")
+                .or_else(|| loc.subkey_path.strip_prefix(r"Software\"))
+            {
+                if !rest.to_lowercase().starts_with(r"wow6432node\") {
+                    return format!(r"HKEY_LOCAL_MACHINE\SOFTWARE\WOW6432Node\{}", rest);
+                }
+            }
+            format!(r"HKEY_LOCAL_MACHINE\{}", loc.subkey_path)
+        }
+    }
+}
+
+fn backup_subkey_recursive(key: &RegKey, reg_key_path: &str, backup: &mut RegBackup) {
+    let mut values = Vec::new();
+    for (vname, _) in key.enum_values().filter_map(|r| r.ok()) {
+        if let Ok(raw) = key.get_raw_value(&vname) {
+            values.push(RegValueBackup {
+                name: vname,
+                data: raw_to_backup_data(raw),
+            });
+        }
+    }
+    backup.add_key(reg_key_path, values);
+
+    for child_name in key.enum_keys().filter_map(|r| r.ok()) {
+        if let Ok(child_key) = key.open_subkey_with_flags(&child_name, KEY_READ) {
+            let child_path = format!(r"{}\{}", reg_key_path, child_name);
+            backup_subkey_recursive(&child_key, &child_path, backup);
+        }
+    }
+}
+
 /// Safely cleans safe remnants after generating an automatic rollback `.reg` backup file.
 /// Returns `(backup_path, deleted_count, errors)`.
 pub fn clean_registry_remnants(
@@ -388,16 +427,7 @@ pub fn clean_registry_remnants_selective(
                     data: val_data,
                 }]);
             } else {
-                let mut values = Vec::new();
-                for (vname, _) in key.enum_values().filter_map(|r| r.ok()) {
-                    if let Ok(raw) = key.get_raw_value(&vname) {
-                        values.push(RegValueBackup {
-                            name: vname,
-                            data: raw_to_backup_data(raw),
-                        });
-                    }
-                }
-                backup.add_key(&key_path, values);
+                backup_subkey_recursive(&key, &key_path, &mut backup);
             }
         }
     }
@@ -465,27 +495,17 @@ pub fn force_remove_uninstall_entry(
         ));
     };
 
-    let (hive_code, hive_name, wow_flag) = match loc.hive {
-        RegistryHive::Hklm64 => (HKEY_LOCAL_MACHINE, "HKEY_LOCAL_MACHINE", KEY_WOW64_64KEY),
-        RegistryHive::Hklm32 => (HKEY_LOCAL_MACHINE, "HKEY_LOCAL_MACHINE", KEY_WOW64_32KEY),
-        RegistryHive::Hkcu => (HKEY_CURRENT_USER, "HKEY_CURRENT_USER", 0),
+    let (hive_code, wow_flag) = match loc.hive {
+        RegistryHive::Hklm64 => (HKEY_LOCAL_MACHINE, KEY_WOW64_64KEY),
+        RegistryHive::Hklm32 => (HKEY_LOCAL_MACHINE, KEY_WOW64_32KEY),
+        RegistryHive::Hkcu => (HKEY_CURRENT_USER, 0),
     };
 
     let root = RegKey::predef(hive_code);
     let key = root.open_subkey_with_flags(&loc.subkey_path, KEY_READ | wow_flag)?;
 
-    let mut values = Vec::new();
-    for (vname, _) in key.enum_values().filter_map(|r| r.ok()) {
-        if let Ok(raw) = key.get_raw_value(&vname) {
-            values.push(RegValueBackup {
-                name: vname,
-                data: raw_to_backup_data(raw),
-            });
-        }
-    }
-
     let mut backup = RegBackup::new();
-    backup.add_key(format!(r"{}\{}", hive_name, loc.subkey_path), values);
+    backup_subkey_recursive(&key, &backup_key_path(loc), &mut backup);
 
     let backup_path = if let Some(dir) = backup_dir {
         let filename = RegBackup::generate_backup_path(&app.id)
@@ -646,5 +666,41 @@ mod tests {
         let mut win32_no_loc = store_app;
         win32_no_loc.uninstaller_kind = crate::models::UninstallerKind::Nsis;
         assert!(force_remove_uninstall_entry(&win32_no_loc, None).is_err());
+    }
+
+    #[test]
+    fn test_backup_key_path_inserts_wow6432node_for_hklm32() {
+        let loc = crate::models::RegistryLocation {
+            hive: RegistryHive::Hklm32,
+            subkey_path: r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\TestApp".into(),
+        };
+        assert_eq!(
+            backup_key_path(&loc),
+            r"HKEY_LOCAL_MACHINE\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\TestApp"
+        );
+    }
+
+    #[test]
+    fn test_backup_subkey_tree_includes_nested_subkeys() {
+        let test_subkey = r"Software\BCU_Rust_Test_BackupTree";
+        let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+        let _ = hkcu.delete_subkey_all(test_subkey);
+
+        {
+            let (parent, _) = hkcu.create_subkey(test_subkey).unwrap();
+            parent.set_value("RootVal", &"root").unwrap();
+            let (child, _) = parent.create_subkey("Child").unwrap();
+            child.set_value("ChildVal", &"nested").unwrap();
+        }
+
+        let mut backup = RegBackup::new();
+        let opened = hkcu.open_subkey_with_flags(test_subkey, KEY_READ).unwrap();
+        backup_subkey_recursive(&opened, &format!(r"HKEY_CURRENT_USER\{}", test_subkey), &mut backup);
+        let _ = hkcu.delete_subkey_all(test_subkey);
+
+        let reg_text = backup.to_reg_string();
+        assert!(reg_text.contains(r"[HKEY_CURRENT_USER\Software\BCU_Rust_Test_BackupTree]"));
+        assert!(reg_text.contains(r"[HKEY_CURRENT_USER\Software\BCU_Rust_Test_BackupTree\Child]"));
+        assert!(reg_text.contains("ChildVal"));
     }
 }

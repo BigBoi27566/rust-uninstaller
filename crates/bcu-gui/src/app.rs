@@ -87,6 +87,10 @@ pub enum AppEvent {
         junk: Vec<JunkItem>,
         remnants: Vec<RegistryRemnant>,
     },
+    RestorePointResult {
+        res: Result<(), String>,
+        next: ConfirmAction,
+    },
     JunkLoaded(Vec<JunkItem>),
     RegistryLoaded(Vec<RegistryRemnant>),
 }
@@ -308,6 +312,31 @@ impl BcuApp {
         self.cached_indices = self.filtered_indices();
     }
 
+    pub fn clear_selection_and_details(&mut self) {
+        self.selected_index = None;
+        self.checked_indices.clear();
+        self.junk_items.clear();
+        self.registry_remnants.clear();
+    }
+
+    pub fn request_uninstall_targets(&mut self, targets: Vec<ApplicationEntry>) {
+        self.clear_selection_and_details();
+        if targets.is_empty() {
+            return;
+        }
+        if targets.iter().any(|a| a.is_protected) {
+            self.pending_confirm = Some(ConfirmAction::BatchUninstall {
+                targets,
+                skip_restore_point: false,
+            });
+        } else {
+            self.execute_confirm_action(ConfirmAction::BatchUninstall {
+                targets,
+                skip_restore_point: false,
+            });
+        }
+    }
+
     fn check_events(&mut self) {
         while let Ok(event) = self.receiver.try_recv() {
             match event {
@@ -324,10 +353,23 @@ impl BcuApp {
                 } => {
                     self.apps = apps;
                     self.is_scanning = false;
+                    self.clear_selection_and_details();
                     self.recompute_filtered_indices();
                     self.status_text = status;
                     if !removed_targets.is_empty() {
                         self.start_post_uninstall_scan(removed_targets);
+                    }
+                }
+                AppEvent::RestorePointResult { res, next } => {
+                    self.is_scanning = false;
+                    match res {
+                        Ok(()) => self.execute_confirm_action(next),
+                        Err(err) => {
+                            self.pending_confirm = Some(ConfirmAction::RestorePointFailed {
+                                error: err,
+                                next: Box::new(next),
+                            });
+                        }
                     }
                 }
                 AppEvent::PostUninstallCleanupReady {
@@ -474,21 +516,11 @@ impl eframe::App for BcuApp {
                             }
                         }
 
-                        self.checked_indices.clear();
-                        self.selected_index = None;
-
                         if targets.is_empty() {
+                            self.clear_selection_and_details();
                             self.status_text = format!("Failed to launch uninstaller: {}", errors.join("; "));
-                        } else if targets.iter().any(|a| a.is_protected) {
-                            self.pending_confirm = Some(ConfirmAction::BatchUninstall {
-                                targets,
-                                skip_restore_point: false,
-                            });
                         } else {
-                            self.execute_confirm_action(ConfirmAction::BatchUninstall {
-                                targets,
-                                skip_restore_point: false,
-                            });
+                            self.request_uninstall_targets(targets);
                         }
                     }
                 }
@@ -526,34 +558,11 @@ impl eframe::App for BcuApp {
                             }
                         }
 
-                        if let Some(ref quiet) = app.quiet_uninstall_string {
+                        if app.quiet_uninstall_string.is_some() {
                             let quiet_btn = ui.button("⚡ Run Quiet Uninstall");
                             show_fade_tooltip(ui, &quiet_btn, "Run vendor uninstaller in silent/unattended mode");
                             if quiet_btn.clicked() {
-                                let cmd = quiet.clone();
-                                let target = app.clone();
-                                let name = app.display_name.clone();
-                                let auto_click = self.auto_click_helper;
-                                let include_store = self.include_store;
-                                let sender = self.sender.clone();
-                                self.is_scanning = true;
-                                self.status_text = format!("Running quiet uninstall for '{}'...", name);
-
-                                thread::spawn(move || {
-                                    let res = run_uninstall_and_wait(&cmd, auto_click);
-                                    thread::sleep(Duration::from_millis(600));
-                                    let apps = rescan_all(include_store);
-                                    let removed_targets = filter_removed_targets(vec![target], &apps);
-                                    let status = match res {
-                                        Ok(()) => format!("Finished uninstalling '{}'. {} apps remaining.", name, apps.len()),
-                                        Err(e) => format!("Failed to uninstall '{}': {}", name, e),
-                                    };
-                                    let _ = sender.send(AppEvent::BatchFinished {
-                                        apps,
-                                        status,
-                                        removed_targets,
-                                    });
-                                });
+                                self.request_uninstall_targets(vec![app.clone()]);
                             }
                         }
 
@@ -724,23 +733,18 @@ impl eframe::App for BcuApp {
         if let Some(mut modal) = self.cleanup_modal.take() {
             match modal.show(ctx) {
                 Some(CleanupAction::Clean { junk, remnants }) => {
-                    let (disk_cleaned, _) = if junk.is_empty() {
+                    let (disk_cleaned, disk_errors) = if junk.is_empty() {
                         (0, Vec::new())
                     } else {
                         clean_junk_items(&junk, true)
                     };
-                    let reg_cleaned = if remnants.is_empty() {
-                        0
+                    let reg_res = if remnants.is_empty() {
+                        None
                     } else {
                         let id = modal.app_names.first().map(|s| s.as_str()).unwrap_or("cleanup");
-                        clean_registry_remnants_selective(&remnants, true, None, id)
-                            .map(|(_, c, _)| c)
-                            .unwrap_or(0)
+                        Some(clean_registry_remnants_selective(&remnants, true, None, id))
                     };
-                    self.status_text = format!(
-                        "Post-uninstall cleanup: recycled {} disk item(s), cleaned {} registry remnant(s).",
-                        disk_cleaned, reg_cleaned
-                    );
+                    self.status_text = format_cleanup_status(disk_cleaned, &disk_errors, reg_res);
                 }
                 Some(CleanupAction::Skip) => {
                     self.status_text = "Skipped post-uninstall leftover cleanup.".into();
@@ -823,24 +827,25 @@ impl BcuApp {
             );
 
         if needs_rp {
-            if let Err(err) = create_system_restore_point() {
-                let next = match action {
-                    ConfirmAction::BatchUninstall { targets, .. } => ConfirmAction::BatchUninstall {
-                        targets,
-                        skip_restore_point: true,
-                    },
-                    ConfirmAction::ForceUninstall { app, .. } => ConfirmAction::ForceUninstall {
-                        app,
-                        skip_restore_point: true,
-                    },
-                    other => other,
-                };
-                self.pending_confirm = Some(ConfirmAction::RestorePointFailed {
-                    error: err,
-                    next: Box::new(next),
-                });
-                return;
-            }
+            let next = match action {
+                ConfirmAction::BatchUninstall { targets, .. } => ConfirmAction::BatchUninstall {
+                    targets,
+                    skip_restore_point: true,
+                },
+                ConfirmAction::ForceUninstall { app, .. } => ConfirmAction::ForceUninstall {
+                    app,
+                    skip_restore_point: true,
+                },
+                other => other,
+            };
+            let sender = self.sender.clone();
+            self.is_scanning = true;
+            self.status_text = "Creating System Restore Point...".into();
+            thread::spawn(move || {
+                let res = create_system_restore_point();
+                let _ = sender.send(AppEvent::RestorePointResult { res, next });
+            });
+            return;
         }
 
         match action {
@@ -850,7 +855,7 @@ impl BcuApp {
             ConfirmAction::ForceUninstall { app, .. } => {
                 match force_remove_uninstall_entry(&app, None) {
                     Ok(backup_path) => {
-                        self.selected_index = None;
+                        self.clear_selection_and_details();
                         self.apps = rescan_all(self.include_store);
                         self.recompute_filtered_indices();
                         self.status_text = format!(
@@ -1117,6 +1122,40 @@ impl BcuApp {
     }
 }
 
+fn format_cleanup_status(
+    disk_cleaned: usize,
+    disk_errors: &[String],
+    reg_res: Option<std::io::Result<(std::path::PathBuf, usize, Vec<String>)>>,
+) -> String {
+    let mut parts = vec![format!("recycled {} disk item(s)", disk_cleaned)];
+    let mut err_count = disk_errors.len();
+    let mut backup_note = String::new();
+
+    match reg_res {
+        Some(Ok((backup_path, reg_cleaned, reg_errors))) => {
+            parts.push(format!("cleaned {} registry remnant(s)", reg_cleaned));
+            err_count += reg_errors.len();
+            backup_note = format!(" Backup: {}", backup_path.display());
+        }
+        Some(Err(e)) => {
+            err_count += 1;
+            parts.push(format!("registry cleanup failed ({})", e));
+        }
+        None => {}
+    }
+
+    if err_count > 0 {
+        format!(
+            "Post-uninstall cleanup: {}, {} failed (try Run as Administrator).{}",
+            parts.join(", "),
+            err_count,
+            backup_note
+        )
+    } else {
+        format!("Post-uninstall cleanup: {}.{}", parts.join(", "), backup_note)
+    }
+}
+
 fn matches_install_dir(install_location: Option<&std::path::Path>, target_dir: &str) -> bool {
     let Some(loc) = install_location else {
         return false;
@@ -1273,6 +1312,44 @@ mod tests {
             r"c:\program files\vlc\"
         ));
         assert!(!matches_install_dir(None, r"C:\Program Files\VLC"));
+    }
+
+    #[test]
+    fn test_clear_selection_and_protected_quiet_uninstall() {
+        let mut gui = BcuApp::default();
+        gui.selected_index = Some(0);
+        gui.checked_indices.insert(1);
+        let protected_app = ApplicationEntry {
+            id: "p1".into(),
+            display_name: "ProtectedApp".into(),
+            display_version: None,
+            publisher: None,
+            install_location: None,
+            uninstall_string: Some("unins000.exe".into()),
+            quiet_uninstall_string: Some("unins000.exe /VERYSILENT".into()),
+            install_date: None,
+            estimated_size_bytes: None,
+            uninstaller_kind: UninstallerKind::InnoSetup,
+            is_system_component: false,
+            is_protected: true,
+            registry_location: None,
+        };
+        gui.request_uninstall_targets(vec![protected_app]);
+        assert!(gui.pending_confirm.is_some());
+        assert!(gui.selected_index.is_none());
+        assert!(gui.checked_indices.is_empty());
+    }
+
+    #[test]
+    fn test_format_cleanup_status_surfaces_errors_and_backup() {
+        let msg = format_cleanup_status(
+            1,
+            &["Access denied".into()],
+            Some(Ok((std::path::PathBuf::from(r"C:\backup.reg"), 0, vec!["HKLM err".into()]))),
+        );
+        assert!(msg.contains("failed"));
+        assert!(msg.contains("Run as Administrator"));
+        assert!(msg.contains("backup.reg"));
     }
 }
 

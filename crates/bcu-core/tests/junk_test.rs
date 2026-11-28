@@ -1,7 +1,10 @@
-use bcu_core::junk::{dir_size_bytes, evaluate_confidence, find_matching_shortcuts_in, scan_disk_junk};
-use bcu_core::models::ConfidenceLevel;
+use bcu_core::junk::{
+    dedupe_nested_junk_items, dir_size_bytes, evaluate_confidence, find_matching_shortcuts_in,
+    scan_disk_junk,
+};
+use bcu_core::models::{ConfidenceLevel, JunkItem};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[test]
 fn test_system_paths_are_strictly_dangerous() {
@@ -84,4 +87,25 @@ fn test_shortcut_matching_in_dir() {
     assert!(found[0].path.ends_with("MyApp.lnk"));
 
     let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn test_dedupe_nested_junk_items_excludes_descendants() {
+    let parent = JunkItem {
+        path: PathBuf::from(r"C:\Program Files\Dropbox"),
+        is_registry: false,
+        confidence: ConfidenceLevel::Safe,
+        reason: "parent".into(),
+        size_bytes: Some(1000),
+    };
+    let child = JunkItem {
+        path: PathBuf::from(r"C:\Program Files\Dropbox\Dropbox"),
+        is_registry: false,
+        confidence: ConfidenceLevel::Safe,
+        reason: "child".into(),
+        size_bytes: Some(500),
+    };
+    let deduped = dedupe_nested_junk_items(vec![parent, child]);
+    assert_eq!(deduped.len(), 1);
+    assert_eq!(deduped[0].path, PathBuf::from(r"C:\Program Files\Dropbox"));
 }

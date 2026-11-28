@@ -244,7 +244,32 @@ pub fn scan_disk_junk_deep(
         }
     }
 
-    items
+    dedupe_nested_junk_items(items)
+}
+
+/// Removes items whose path is equal to or nested inside another `JunkItem` directory.
+pub fn dedupe_nested_junk_items(mut items: Vec<JunkItem>) -> Vec<JunkItem> {
+    let norm = |p: &Path| {
+        p.to_string_lossy()
+            .trim_end_matches(['\\', '/'])
+            .to_lowercase()
+    };
+    items.sort_by_key(|i| norm(&i.path).len());
+    let mut kept: Vec<JunkItem> = Vec::with_capacity(items.len());
+    let mut kept_paths: Vec<String> = Vec::with_capacity(items.len());
+    for item in items {
+        let p = norm(&item.path);
+        let is_nested = kept_paths.iter().any(|parent| {
+            p == *parent
+                || (p.starts_with(parent.as_str())
+                    && p.as_bytes().get(parent.len()).is_some_and(|&b| b == b'\\' || b == b'/'))
+        });
+        if !is_nested {
+            kept_paths.push(p);
+            kept.push(item);
+        }
+    }
+    kept
 }
 
 fn get_shortcut_search_roots() -> Vec<PathBuf> {
@@ -263,24 +288,31 @@ fn get_shortcut_search_roots() -> Vec<PathBuf> {
 
 fn get_candidate_search_roots() -> Vec<PathBuf> {
     let mut roots = Vec::new();
+    let mut seen = HashSet::new();
+    let mut push_unique = |p: PathBuf| {
+        let key = p.to_string_lossy().trim_end_matches(['\\', '/']).to_lowercase();
+        if !key.is_empty() && seen.insert(key) {
+            roots.push(p);
+        }
+    };
 
     if let Ok(pf) = env::var("ProgramFiles") {
-        roots.push(PathBuf::from(pf));
+        push_unique(PathBuf::from(pf));
     }
     if let Ok(pf86) = env::var("ProgramFiles(x86)") {
-        roots.push(PathBuf::from(pf86));
+        push_unique(PathBuf::from(pf86));
     }
     if let Ok(pd) = env::var("ProgramData") {
-        roots.push(PathBuf::from(pd));
+        push_unique(PathBuf::from(pd));
     }
     if let Ok(appdata) = env::var("APPDATA") {
-        roots.push(PathBuf::from(appdata));
+        push_unique(PathBuf::from(appdata));
     }
     if let Ok(localappdata) = env::var("LOCALAPPDATA") {
-        roots.push(PathBuf::from(localappdata));
+        push_unique(PathBuf::from(localappdata));
     }
     if let Ok(profile) = env::var("USERPROFILE") {
-        roots.push(PathBuf::from(profile).join(r"AppData\LocalLow"));
+        push_unique(PathBuf::from(profile).join(r"AppData\LocalLow"));
     }
 
     roots
