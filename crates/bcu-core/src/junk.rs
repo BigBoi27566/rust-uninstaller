@@ -177,8 +177,8 @@ fn collect_if_matching_shortcut(path: &Path, app_name: &str, out: &mut Vec<JunkI
         return;
     };
     if crate::heuristics::matches_app_name(stem, app_name) {
-        let confidence = evaluate_confidence(path, app_name, None);
-        let size_bytes = fs::metadata(path).map(|m| m.len()).ok();
+        let confidence = evaluate_confidence(Path::new(stem), app_name, None);
+        let size_bytes = fs::symlink_metadata(path).map(|m| m.len()).ok();
         out.push(JunkItem {
             path: path.to_path_buf(),
             is_registry: false,

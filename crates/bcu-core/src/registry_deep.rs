@@ -373,6 +373,15 @@ fn backup_subkey_recursive(key: &RegKey, reg_key_path: &str, backup: &mut RegBac
     }
 }
 
+fn resolve_backup_path(backup_dir: Option<&Path>, app_id: &str) -> PathBuf {
+    let generated = RegBackup::generate_backup_path(app_id);
+    if let Some(dir) = backup_dir {
+        dir.join(generated.file_name().unwrap_or_default())
+    } else {
+        generated
+    }
+}
+
 /// Safely cleans safe remnants after generating an automatic rollback `.reg` backup file.
 /// Returns `(backup_path, deleted_count, errors)`.
 pub fn clean_registry_remnants(
@@ -432,16 +441,7 @@ pub fn clean_registry_remnants_selective(
         }
     }
 
-    let backup_path = if let Some(dir) = backup_dir {
-        let filename = RegBackup::generate_backup_path(app_id)
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .to_string();
-        dir.join(filename)
-    } else {
-        RegBackup::generate_backup_path(app_id)
-    };
+    let backup_path = resolve_backup_path(backup_dir, app_id);
 
     backup.save_to_file(&backup_path)?;
 
@@ -507,16 +507,7 @@ pub fn force_remove_uninstall_entry(
     let mut backup = RegBackup::new();
     backup_subkey_recursive(&key, &backup_key_path(loc), &mut backup);
 
-    let backup_path = if let Some(dir) = backup_dir {
-        let filename = RegBackup::generate_backup_path(&app.id)
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .to_string();
-        dir.join(filename)
-    } else {
-        RegBackup::generate_backup_path(&app.id)
-    };
+    let backup_path = resolve_backup_path(backup_dir, &app.id);
     backup.save_to_file(&backup_path)?;
 
     let (parent_path, leaf) = loc

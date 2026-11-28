@@ -85,6 +85,7 @@ fn test_shortcut_matching_in_dir() {
     let found = find_matching_shortcuts_in(&temp_dir, "MyApp");
     assert_eq!(found.len(), 1);
     assert!(found[0].path.ends_with("MyApp.lnk"));
+    assert_eq!(found[0].confidence, ConfidenceLevel::Safe);
 
     let _ = fs::remove_dir_all(&temp_dir);
 }

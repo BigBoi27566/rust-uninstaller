@@ -145,10 +145,7 @@ impl BcuApp {
     pub fn start_scan(&mut self) {
         self.is_scanning = true;
         self.status_text = "Scanning registry and installed applications...".into();
-        self.selected_index = None;
-        self.checked_indices.clear();
-        self.junk_items.clear();
-        self.registry_remnants.clear();
+        self.clear_selection_and_details();
 
         let tx = self.sender.clone();
         let include_store = self.include_store;
@@ -1171,7 +1168,15 @@ fn is_uninstaller_missing(app: &ApplicationEntry) -> bool {
     let Some((exe, _)) = bcu_core::heuristics::parse_command_line(raw_cmd) else {
         return false;
     };
+    // shortcut: unexpanded %VAR% paths assumed valid, expand via ExpandEnvironmentStringsW if needed later
+    if exe.contains('%') {
+        return false;
+    }
     (exe.contains('\\') || exe.contains('/')) && !std::path::Path::new(&exe).exists()
+}
+
+fn is_uninstall_success(code: Option<i32>) -> bool {
+    matches!(code, Some(0 | 3010))
 }
 
 fn filter_removed_targets(
@@ -1192,7 +1197,7 @@ fn run_uninstall_and_wait(cmd: &str) -> std::io::Result<()> {
     let mut child = launch_uninstall_command(cmd)?;
     loop {
         if let Some(status) = child.try_wait()? {
-            if status.success() {
+            if is_uninstall_success(status.code()) {
                 return Ok(());
             }
             return Err(std::io::Error::other(format!(
@@ -1253,8 +1258,19 @@ mod tests {
         };
         assert!(is_uninstaller_missing(&app));
 
+        app.uninstall_string = Some(r#""%LocalAppData%\Discord\Update.exe" --uninstall"#.into());
+        assert!(!is_uninstaller_missing(&app));
+
         app.uninstaller_kind = UninstallerKind::StoreApp;
         assert!(!is_uninstaller_missing(&app));
+    }
+
+    #[test]
+    fn test_is_uninstall_success_accepts_zero_and_3010() {
+        assert!(is_uninstall_success(Some(0)));
+        assert!(is_uninstall_success(Some(3010)));
+        assert!(!is_uninstall_success(Some(1603)));
+        assert!(!is_uninstall_success(None));
     }
 
     #[test]
