@@ -1,11 +1,14 @@
+use crate::cleanup_modal::{CleanupAction, CleanupModalState};
 use bcu_core::automation::run_automation_cycle;
 use bcu_core::export::export_to_csv;
-use bcu_core::junk::scan_disk_junk;
+use bcu_core::junk::{scan_disk_junk, scan_disk_junk_deep};
 use bcu_core::models::{ApplicationEntry, ConfidenceLevel, JunkItem};
 use bcu_core::queue::{TaskStatus, UninstallQueue};
 use bcu_core::recycle::clean_junk_items;
 use bcu_core::registry::scan_registry_uninstallers;
-use bcu_core::registry_deep::{clean_registry_remnants, scan_deep_registry, RegistryRemnant};
+use bcu_core::registry_deep::{
+    clean_registry_remnants, clean_registry_remnants_selective, scan_deep_registry, RegistryRemnant,
+};
 use bcu_core::store::scan_store_apps;
 use eframe::egui::{self, Color32, Response, Ui};
 use egui_extras::{Column, TableBuilder};
@@ -53,6 +56,12 @@ pub enum AppEvent {
     BatchFinished {
         apps: Vec<ApplicationEntry>,
         status: String,
+        removed_targets: Vec<ApplicationEntry>,
+    },
+    PostUninstallCleanupReady {
+        app_names: Vec<String>,
+        junk: Vec<JunkItem>,
+        remnants: Vec<RegistryRemnant>,
     },
     JunkLoaded(Vec<JunkItem>),
     RegistryLoaded(Vec<RegistryRemnant>),
@@ -71,6 +80,7 @@ pub struct BcuApp {
     pub is_scanning_registry: bool,
     pub junk_items: Vec<JunkItem>,
     pub registry_remnants: Vec<RegistryRemnant>,
+    pub cleanup_modal: Option<CleanupModalState>,
     pub status_text: String,
     sender: Sender<AppEvent>,
     receiver: Receiver<AppEvent>,
@@ -92,6 +102,7 @@ impl Default for BcuApp {
             is_scanning_registry: false,
             junk_items: Vec::new(),
             registry_remnants: Vec::new(),
+            cleanup_modal: None,
             status_text: "Initializing...".into(),
             sender,
             receiver,
@@ -150,6 +161,47 @@ impl BcuApp {
         thread::spawn(move || {
             let remnants = scan_deep_registry(&app);
             let _ = tx.send(AppEvent::RegistryLoaded(remnants));
+        });
+    }
+
+    pub fn start_post_uninstall_scan(&self, targets: Vec<ApplicationEntry>) {
+        let tx = self.sender.clone();
+        thread::spawn(move || {
+            let mut app_names = Vec::new();
+            let mut all_junk = Vec::new();
+            let mut all_remnants = Vec::new();
+            let mut seen_paths = HashSet::new();
+            let mut seen_regs = HashSet::new();
+
+            for app in targets {
+                app_names.push(app.display_name.clone());
+                for item in scan_disk_junk_deep(
+                    &app.display_name,
+                    app.publisher.as_deref(),
+                    app.install_location.as_deref(),
+                ) {
+                    if seen_paths.insert(item.path.clone()) {
+                        all_junk.push(item);
+                    }
+                }
+                for rem in scan_deep_registry(&app) {
+                    let key = format!(
+                        "{}:{}:{}",
+                        rem.hive,
+                        rem.subkey,
+                        rem.value_name.as_deref().unwrap_or("")
+                    );
+                    if seen_regs.insert(key) {
+                        all_remnants.push(rem);
+                    }
+                }
+            }
+
+            let _ = tx.send(AppEvent::PostUninstallCleanupReady {
+                app_names,
+                junk: all_junk,
+                remnants: all_remnants,
+            });
         });
     }
 
@@ -238,10 +290,27 @@ impl BcuApp {
                     self.is_scanning = false;
                     self.status_text = format!("Ready: {} applications loaded.", self.apps.len());
                 }
-                AppEvent::BatchFinished { apps, status } => {
+                AppEvent::BatchFinished {
+                    apps,
+                    status,
+                    removed_targets,
+                } => {
                     self.apps = apps;
                     self.is_scanning = false;
                     self.status_text = status;
+                    if !removed_targets.is_empty() {
+                        self.start_post_uninstall_scan(removed_targets);
+                    }
+                }
+                AppEvent::PostUninstallCleanupReady {
+                    app_names,
+                    junk,
+                    remnants,
+                } => {
+                    if !junk.is_empty() || !remnants.is_empty() {
+                        self.cleanup_modal =
+                            Some(CleanupModalState::from_results(app_names, junk, remnants));
+                    }
                 }
                 AppEvent::JunkLoaded(items) => {
                     self.junk_items = items;
@@ -344,12 +413,14 @@ impl eframe::App for BcuApp {
                         let include_store = self.include_store;
                         let sender = self.sender.clone();
                         let mut queue = UninstallQueue::new();
+                        let mut launched_targets = Vec::new();
                         let mut errors = Vec::new();
                         let mut queued = 0usize;
 
                         for &idx in &self.checked_indices {
                             if let Some(app) = self.apps.get(idx).cloned() {
                                 if app.quiet_uninstall_string.is_some() || app.uninstall_string.is_some() {
+                                    launched_targets.push(app.clone());
                                     queue.add(app);
                                     queued += 1;
                                 } else {
@@ -409,12 +480,17 @@ impl eframe::App for BcuApp {
 
                                 thread::sleep(Duration::from_millis(600));
                                 let apps = rescan_all(include_store);
+                                let removed_targets = filter_removed_targets(launched_targets, &apps);
                                 let status = if errors.is_empty() {
                                     format!("Finished uninstalling {} app(s). {} apps remaining.", queued, apps.len())
                                 } else {
                                     format!("Uninstall finished with errors: {}", errors.join("; "))
                                 };
-                                let _ = sender.send(AppEvent::BatchFinished { apps, status });
+                                let _ = sender.send(AppEvent::BatchFinished {
+                                    apps,
+                                    status,
+                                    removed_targets,
+                                });
                             });
                         }
                     }
@@ -441,6 +517,7 @@ impl eframe::App for BcuApp {
                             show_fade_tooltip(ui, &quiet_btn, "Run vendor uninstaller in silent/unattended mode");
                             if quiet_btn.clicked() {
                                 let cmd = quiet.clone();
+                                let target = app.clone();
                                 let name = app.display_name.clone();
                                 let auto_click = self.auto_click_helper;
                                 let include_store = self.include_store;
@@ -452,11 +529,16 @@ impl eframe::App for BcuApp {
                                     let res = run_uninstall_and_wait(&cmd, auto_click);
                                     thread::sleep(Duration::from_millis(600));
                                     let apps = rescan_all(include_store);
+                                    let removed_targets = filter_removed_targets(vec![target], &apps);
                                     let status = match res {
                                         Ok(()) => format!("Finished uninstalling '{}'. {} apps remaining.", name, apps.len()),
                                         Err(e) => format!("Failed to uninstall '{}': {}", name, e),
                                     };
-                                    let _ = sender.send(AppEvent::BatchFinished { apps, status });
+                                    let _ = sender.send(AppEvent::BatchFinished {
+                                        apps,
+                                        status,
+                                        removed_targets,
+                                    });
                                 });
                             }
                         }
@@ -617,6 +699,36 @@ impl eframe::App for BcuApp {
             let indices = self.filtered_indices();
             self.render_table(ui, &indices);
         });
+
+        if let Some(mut modal) = self.cleanup_modal.take() {
+            match modal.show(ctx) {
+                Some(CleanupAction::Clean { junk, remnants }) => {
+                    let (disk_cleaned, _) = if junk.is_empty() {
+                        (0, Vec::new())
+                    } else {
+                        clean_junk_items(&junk, true)
+                    };
+                    let reg_cleaned = if remnants.is_empty() {
+                        0
+                    } else {
+                        let id = modal.app_names.first().map(|s| s.as_str()).unwrap_or("cleanup");
+                        clean_registry_remnants_selective(&remnants, true, None, id)
+                            .map(|(_, c, _)| c)
+                            .unwrap_or(0)
+                    };
+                    self.status_text = format!(
+                        "Post-uninstall cleanup: recycled {} disk item(s), cleaned {} registry remnant(s).",
+                        disk_cleaned, reg_cleaned
+                    );
+                }
+                Some(CleanupAction::Skip) => {
+                    self.status_text = "Skipped post-uninstall leftover cleanup.".into();
+                }
+                None => {
+                    self.cleanup_modal = Some(modal);
+                }
+            }
+        }
     }
 }
 
@@ -778,16 +890,69 @@ fn rescan_all(include_store: bool) -> Vec<ApplicationEntry> {
     apps
 }
 
+fn filter_removed_targets(
+    launched: Vec<ApplicationEntry>,
+    current_apps: &[ApplicationEntry],
+) -> Vec<ApplicationEntry> {
+    launched
+        .into_iter()
+        .filter(|t| {
+            !current_apps
+                .iter()
+                .any(|a| a.id == t.id && a.display_name == t.display_name)
+        })
+        .collect()
+}
+
 fn run_uninstall_and_wait(cmd: &str, auto_click: bool) -> std::io::Result<()> {
     let mut child = launch_uninstall_command(cmd)?;
     let pid = child.id();
-    while child.try_wait()?.is_none() {
+    loop {
+        if let Some(status) = child.try_wait()? {
+            if status.success() {
+                return Ok(());
+            }
+            return Err(std::io::Error::other(format!(
+                "Uninstaller exited with status {}",
+                status
+            )));
+        }
         if auto_click {
             let _ = run_automation_cycle(pid);
         }
         thread::sleep(Duration::from_millis(500));
     }
-    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bcu_core::models::UninstallerKind;
+
+    #[test]
+    fn test_filter_removed_targets_skips_still_installed_apps() {
+        let app = |id: &str, name: &str| ApplicationEntry {
+            id: id.into(),
+            display_name: name.into(),
+            display_version: None,
+            publisher: None,
+            install_location: None,
+            uninstall_string: None,
+            quiet_uninstall_string: None,
+            install_date: None,
+            estimated_size_bytes: None,
+            uninstaller_kind: UninstallerKind::Nsis,
+            is_system_component: false,
+            is_protected: false,
+            registry_location: None,
+        };
+
+        let cancelled = app("1", "CancelledApp");
+        let removed = app("2", "RemovedApp");
+        let res = filter_removed_targets(vec![cancelled.clone(), removed.clone()], &[cancelled]);
+        assert_eq!(res.len(), 1);
+        assert_eq!(res[0].id, "2");
+    }
 }
 
 fn launch_uninstall_command(cmd: &str) -> std::io::Result<Child> {

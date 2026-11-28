@@ -1,6 +1,7 @@
 #![windows_subsystem = "windows"]
 
 mod app;
+mod cleanup_modal;
 pub mod treemap;
 
 use app::BcuApp;
