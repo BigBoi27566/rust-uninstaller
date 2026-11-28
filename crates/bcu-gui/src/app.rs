@@ -14,7 +14,7 @@ use eframe::egui::{self, Color32, Response, Ui};
 use egui_extras::{Column, TableBuilder};
 use std::collections::HashSet;
 use std::env;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::thread;
@@ -418,7 +418,8 @@ impl eframe::App for BcuApp {
 
                 ui.separator();
 
-                let store_cb = ui.checkbox(&mut self.include_store, "Store Apps");
+                let store_cb = ui
+                    .add_enabled(!self.is_scanning, egui::Checkbox::new(&mut self.include_store, "Store Apps"));
                 if store_cb.changed() {
                     self.start_scan();
                 }
@@ -432,7 +433,7 @@ impl eframe::App for BcuApp {
 
                 ui.separator();
 
-                let refresh_btn = ui.button("Refresh");
+                let refresh_btn = ui.add_enabled(!self.is_scanning, egui::Button::new("Refresh"));
                 if refresh_btn.clicked() {
                     self.start_scan();
                 }
@@ -441,7 +442,10 @@ impl eframe::App for BcuApp {
                 let checked_count = self.checked_indices.len();
                 if checked_count > 0 {
                     ui.separator();
-                    let uninstall_btn = ui.button(format!("Uninstall Selected ({})", checked_count));
+                    let uninstall_btn = ui.add_enabled(
+                        !self.is_scanning,
+                        egui::Button::new(format!("Uninstall Selected ({})", checked_count)),
+                    );
                     show_fade_tooltip(ui, &uninstall_btn, "Launch silent uninstaller for checked programs");
                     if uninstall_btn.clicked() {
                         let mut targets = Vec::new();
@@ -489,7 +493,7 @@ impl eframe::App for BcuApp {
                         ui.separator();
 
                         if app.uninstaller_kind != UninstallerKind::StoreApp && app.registry_location.is_some() {
-                            let force_btn = ui.button("Force Uninstall");
+                            let force_btn = ui.add_enabled(!self.is_scanning, egui::Button::new("Force Uninstall"));
                             show_fade_tooltip(ui, &force_btn, "Remove Uninstall registry entry and scan leftovers");
                             if force_btn.clicked() {
                                 self.pending_confirm = Some(ConfirmAction::ForceUninstall { app: app.clone() });
@@ -497,7 +501,7 @@ impl eframe::App for BcuApp {
                         }
 
                         if app.quiet_uninstall_string.is_some() {
-                            let quiet_btn = ui.button("Run Quiet Uninstall");
+                            let quiet_btn = ui.add_enabled(!self.is_scanning, egui::Button::new("Run Quiet Uninstall"));
                             show_fade_tooltip(ui, &quiet_btn, "Run vendor uninstaller in silent/unattended mode");
                             if quiet_btn.clicked() {
                                 self.request_uninstall_targets(vec![app.clone()]);
@@ -516,21 +520,25 @@ impl eframe::App for BcuApp {
                             let recycle_btn = ui.button("Send Safe Junk to Recycle Bin");
                             show_fade_tooltip(ui, &recycle_btn, "Move safe leftover files to Windows Recycle Bin");
                             if recycle_btn.clicked() {
-                                let (cleaned, errors) = clean_junk_items(&self.junk_items, false);
+                                let safe_junk = filter_safe_junk(&self.junk_items);
+                                let (cleaned, errors) = clean_junk_items(&safe_junk, false);
                                 let summary = build_cleanup_summary(
                                     &[app.display_name.clone()],
-                                    &self.junk_items,
+                                    &safe_junk,
                                     &[],
                                     cleaned,
                                     &errors,
                                     0,
                                 );
-                                let zip_res = RegBackup::create_desktop_backup_zip(None, &summary);
-                                self.status_text = match zip_res {
-                                    Ok(zp) => format!("Recycled {} item(s). Backup: {}", cleaned, zp.display()),
-                                    Err(e) => format!("Recycled {} item(s). Zip backup failed: {}", cleaned, e),
+                                self.status_text = match maybe_create_desktop_zip(cleaned, None, &summary) {
+                                    Some(Ok(zp)) => format!("Recycled {} item(s). Backup: {}", cleaned, zp.display()),
+                                    Some(Err(e)) => format!("Recycled {} item(s). Zip backup failed: {}", cleaned, e),
+                                    None if errors.is_empty() => format!("Recycled {} safe item(s).", cleaned),
+                                    None => format!("Recycled 0 item(s), {} failed.", errors.len()),
                                 };
-                                self.junk_items.clear();
+                                if cleaned > 0 {
+                                    self.junk_items.clear();
+                                }
                             }
                         }
 
@@ -544,21 +552,23 @@ impl eframe::App for BcuApp {
                             let clean_reg_btn = ui.button("Backup & Clean Registry");
                             show_fade_tooltip(ui, &clean_reg_btn, "Export rollback backup .reg + Desktop .zip before cleaning");
                             if clean_reg_btn.clicked() {
-                                match clean_registry_remnants(&self.registry_remnants, None, &app.id) {
+                                let safe_remnants = filter_safe_remnants(&self.registry_remnants);
+                                match clean_registry_remnants(&safe_remnants, None, &app.id) {
                                     Ok((backup_path, deleted, errors)) => {
                                         let summary = build_cleanup_summary(
                                             &[app.display_name.clone()],
                                             &[],
-                                            &self.registry_remnants,
+                                            &safe_remnants,
                                             0,
                                             &errors,
                                             deleted,
                                         );
-                                        let zip_path = RegBackup::create_desktop_backup_zip(
+                                        let zip_path = maybe_create_desktop_zip(
+                                            deleted,
                                             Some(&backup_path),
                                             &summary,
                                         )
-                                        .ok();
+                                        .and_then(Result::ok);
                                         let shown_backup = zip_path.unwrap_or(backup_path);
                                         self.status_text = if errors.is_empty() {
                                             format!(
@@ -712,7 +722,12 @@ impl eframe::App for BcuApp {
                         &all_errors,
                         reg_cleaned,
                     );
-                    let zip_path = RegBackup::create_desktop_backup_zip(reg_backup_path, &summary).ok();
+                    let zip_path = maybe_create_desktop_zip(
+                        disk_cleaned + reg_cleaned,
+                        reg_backup_path,
+                        &summary,
+                    )
+                    .and_then(Result::ok);
                     self.status_text = format_cleanup_status(disk_cleaned, &disk_errors, reg_res, zip_path);
                 }
                 Some(CleanupAction::Skip) => {
@@ -1015,6 +1030,33 @@ impl BcuApp {
     }
 }
 
+fn filter_safe_junk(items: &[JunkItem]) -> Vec<JunkItem> {
+    items
+        .iter()
+        .filter(|j| !j.is_registry && j.confidence == ConfidenceLevel::Safe)
+        .cloned()
+        .collect()
+}
+
+fn filter_safe_remnants(remnants: &[RegistryRemnant]) -> Vec<RegistryRemnant> {
+    remnants
+        .iter()
+        .filter(|r| r.confidence == ConfidenceLevel::Safe)
+        .cloned()
+        .collect()
+}
+
+fn maybe_create_desktop_zip(
+    deleted_count: usize,
+    reg_backup_path: Option<&Path>,
+    summary: &str,
+) -> Option<std::io::Result<PathBuf>> {
+    if deleted_count == 0 {
+        return None;
+    }
+    Some(RegBackup::create_desktop_backup_zip(reg_backup_path, summary))
+}
+
 fn build_cleanup_summary(
     app_names: &[String],
     junk: &[JunkItem],
@@ -1261,6 +1303,37 @@ mod tests {
         assert!(msg.contains("failed"));
         assert!(msg.contains("Run as Administrator"));
         assert!(msg.contains("backup(2026-11-28_16-10-00).zip"));
+    }
+
+    #[test]
+    fn test_safe_junk_filter_excludes_questionable_and_dangerous() {
+        let items = vec![
+            JunkItem {
+                path: PathBuf::from(r"C:\Safe"),
+                is_registry: false,
+                confidence: ConfidenceLevel::Safe,
+                reason: "safe".into(),
+                size_bytes: Some(10),
+            },
+            JunkItem {
+                path: PathBuf::from(r"C:\Maybe"),
+                is_registry: false,
+                confidence: ConfidenceLevel::Questionable,
+                reason: "maybe".into(),
+                size_bytes: Some(20),
+            },
+            JunkItem {
+                path: PathBuf::from(r"C:\Windows"),
+                is_registry: false,
+                confidence: ConfidenceLevel::Dangerous,
+                reason: "danger".into(),
+                size_bytes: None,
+            },
+        ];
+        let safe = filter_safe_junk(&items);
+        assert_eq!(safe.len(), 1);
+        assert_eq!(safe[0].path, PathBuf::from(r"C:\Safe"));
+        assert!(maybe_create_desktop_zip(0, None, "none").is_none());
     }
 }
 
