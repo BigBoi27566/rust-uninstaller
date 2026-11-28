@@ -1,5 +1,6 @@
 use crate::models::{ConfidenceLevel, JunkItem};
 use rayon::prelude::*;
+use std::collections::HashSet;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -137,6 +138,129 @@ pub fn scan_disk_junk(app_name: &str, known_install_dir: Option<&Path>) -> Vec<J
         .collect()
 }
 
+/// Finds `.lnk` shortcuts in `dir` (and 1-level subfolders) whose stem matches `app_name`.
+pub fn find_matching_shortcuts_in(dir: &Path, app_name: &str) -> Vec<JunkItem> {
+    let mut found = Vec::new();
+    let trimmed = app_name.trim();
+    if trimmed.is_empty() || !dir.is_dir() {
+        return found;
+    }
+
+    let Ok(entries) = fs::read_dir(dir) else {
+        return found;
+    };
+
+    for entry in entries.filter_map(|e| e.ok()) {
+        let path = entry.path();
+        if path.is_dir() {
+            if let Ok(sub_entries) = fs::read_dir(&path) {
+                for sub in sub_entries.filter_map(|e| e.ok()) {
+                    collect_if_matching_shortcut(&sub.path(), trimmed, &mut found);
+                }
+            }
+        } else {
+            collect_if_matching_shortcut(&path, trimmed, &mut found);
+        }
+    }
+    found
+}
+
+fn collect_if_matching_shortcut(path: &Path, app_name: &str, out: &mut Vec<JunkItem>) {
+    let is_lnk = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("lnk"));
+    if !is_lnk {
+        return;
+    }
+    let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+        return;
+    };
+    if crate::heuristics::matches_app_name(stem, app_name) {
+        let confidence = evaluate_confidence(path, app_name, None);
+        let size_bytes = fs::metadata(path).map(|m| m.len()).ok();
+        out.push(JunkItem {
+            path: path.to_path_buf(),
+            is_registry: false,
+            confidence,
+            reason: format!("Shortcut matches application name '{}'", app_name),
+            size_bytes,
+        });
+    }
+}
+
+/// Deep disk scan including `LocalLow`, `Publisher\AppName` folders, and Start Menu/Desktop `.lnk` shortcuts.
+pub fn scan_disk_junk_deep(
+    app_name: &str,
+    publisher: Option<&str>,
+    known_install_dir: Option<&Path>,
+) -> Vec<JunkItem> {
+    let trimmed_app = app_name.trim();
+    if trimmed_app.is_empty() {
+        return Vec::new();
+    }
+
+    let mut items = scan_disk_junk(trimmed_app, known_install_dir);
+    let mut seen: HashSet<PathBuf> = items.iter().map(|i| i.path.clone()).collect();
+
+    if let Some(pub_name) = publisher.map(str::trim).filter(|p| !p.is_empty()) {
+        let pub_lower = pub_name.to_lowercase();
+        if !PROTECTED_NAMES.iter().any(|&p| p == pub_lower) {
+            for root in get_candidate_search_roots() {
+                let pub_dir = root.join(pub_name);
+                if let Ok(entries) = fs::read_dir(&pub_dir) {
+                    for entry in entries.filter_map(|e| e.ok()) {
+                        let path = entry.path();
+                        if path.is_dir() && seen.insert(path.clone()) {
+                            let file_name = entry.file_name();
+                            let name = file_name.to_string_lossy();
+                            if crate::heuristics::matches_app_name(&name, trimmed_app) {
+                                let confidence = evaluate_confidence(&path, trimmed_app, known_install_dir);
+                                let size_bytes = if confidence == ConfidenceLevel::Dangerous {
+                                    None
+                                } else {
+                                    Some(dir_size_bytes(&path))
+                                };
+                                items.push(JunkItem {
+                                    path,
+                                    is_registry: false,
+                                    confidence,
+                                    reason: format!("Directory under publisher '{}' matches '{}'", pub_name, trimmed_app),
+                                    size_bytes,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    for shortcut_dir in get_shortcut_search_roots() {
+        for item in find_matching_shortcuts_in(&shortcut_dir, trimmed_app) {
+            if seen.insert(item.path.clone()) {
+                items.push(item);
+            }
+        }
+    }
+
+    items
+}
+
+fn get_shortcut_search_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    if let Ok(appdata) = env::var("APPDATA") {
+        roots.push(PathBuf::from(appdata).join(r"Microsoft\Windows\Start Menu\Programs"));
+    }
+    if let Ok(pd) = env::var("ProgramData") {
+        roots.push(PathBuf::from(pd).join(r"Microsoft\Windows\Start Menu\Programs"));
+    }
+    if let Ok(profile) = env::var("USERPROFILE") {
+        roots.push(PathBuf::from(profile).join("Desktop"));
+    }
+    roots
+}
+
 fn get_candidate_search_roots() -> Vec<PathBuf> {
     let mut roots = Vec::new();
 
@@ -154,6 +278,9 @@ fn get_candidate_search_roots() -> Vec<PathBuf> {
     }
     if let Ok(localappdata) = env::var("LOCALAPPDATA") {
         roots.push(PathBuf::from(localappdata));
+    }
+    if let Ok(profile) = env::var("USERPROFILE") {
+        roots.push(PathBuf::from(profile).join(r"AppData\LocalLow"));
     }
 
     roots

@@ -1,4 +1,4 @@
-use crate::models::{ApplicationEntry, ConfidenceLevel};
+use crate::models::{ApplicationEntry, ConfidenceLevel, RegistryHive, UninstallerKind};
 use crate::reg_backup::{RegBackup, RegValueBackup, RegValueData};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -341,9 +341,23 @@ pub fn clean_registry_remnants(
     backup_dir: Option<&Path>,
     app_id: &str,
 ) -> std::io::Result<(PathBuf, usize, Vec<String>)> {
+    clean_registry_remnants_selective(remnants, false, backup_dir, app_id)
+}
+
+/// Cleans `Safe` remnants (and `Questionable` if `allow_questionable` is true) after `.reg` backup.
+/// `Dangerous` remnants are always refused. Returns `(backup_path, deleted_count, errors)`.
+pub fn clean_registry_remnants_selective(
+    remnants: &[RegistryRemnant],
+    allow_questionable: bool,
+    backup_dir: Option<&Path>,
+    app_id: &str,
+) -> std::io::Result<(PathBuf, usize, Vec<String>)> {
     let safe_remnants: Vec<&RegistryRemnant> = remnants
         .iter()
-        .filter(|r| r.confidence == ConfidenceLevel::Safe)
+        .filter(|r| {
+            r.confidence == ConfidenceLevel::Safe
+                || (allow_questionable && r.confidence == ConfidenceLevel::Questionable)
+        })
         .collect();
 
     if safe_remnants.is_empty() {
@@ -431,6 +445,71 @@ pub fn clean_registry_remnants(
     Ok((backup_path, deleted_count, errors))
 }
 
+/// Backs up and deletes an application's `Uninstall` registry key for Force Uninstall.
+/// Refuses `StoreApp` entries and entries without `registry_location`.
+pub fn force_remove_uninstall_entry(
+    app: &ApplicationEntry,
+    backup_dir: Option<&Path>,
+) -> std::io::Result<PathBuf> {
+    if app.uninstaller_kind == UninstallerKind::StoreApp {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Force Uninstall is disabled for Store/UWP applications",
+        ));
+    }
+
+    let Some(ref loc) = app.registry_location else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Missing registry location for Force Uninstall",
+        ));
+    };
+
+    let (hive_code, hive_name, wow_flag) = match loc.hive {
+        RegistryHive::Hklm64 => (HKEY_LOCAL_MACHINE, "HKEY_LOCAL_MACHINE", KEY_WOW64_64KEY),
+        RegistryHive::Hklm32 => (HKEY_LOCAL_MACHINE, "HKEY_LOCAL_MACHINE", KEY_WOW64_32KEY),
+        RegistryHive::Hkcu => (HKEY_CURRENT_USER, "HKEY_CURRENT_USER", 0),
+    };
+
+    let root = RegKey::predef(hive_code);
+    let key = root.open_subkey_with_flags(&loc.subkey_path, KEY_READ | wow_flag)?;
+
+    let mut values = Vec::new();
+    for (vname, _) in key.enum_values().filter_map(|r| r.ok()) {
+        if let Ok(raw) = key.get_raw_value(&vname) {
+            values.push(RegValueBackup {
+                name: vname,
+                data: raw_to_backup_data(raw),
+            });
+        }
+    }
+
+    let mut backup = RegBackup::new();
+    backup.add_key(format!(r"{}\{}", hive_name, loc.subkey_path), values);
+
+    let backup_path = if let Some(dir) = backup_dir {
+        let filename = RegBackup::generate_backup_path(&app.id)
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+        dir.join(filename)
+    } else {
+        RegBackup::generate_backup_path(&app.id)
+    };
+    backup.save_to_file(&backup_path)?;
+
+    let (parent_path, leaf) = loc
+        .subkey_path
+        .rsplit_once('\\')
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "Invalid registry subkey path"))?;
+
+    let parent_key = root.open_subkey_with_flags(parent_path, KEY_WRITE | wow_flag)?;
+    parent_key.delete_subkey_all(leaf)?;
+
+    Ok(backup_path)
+}
+
 fn extract_filename(cmd: &str) -> Option<String> {
     let trimmed = cmd.trim();
     let unquoted = if trimmed.starts_with('"') {
@@ -516,5 +595,56 @@ mod tests {
             }),
             RegValueData::Dword(42)
         );
+    }
+
+    #[test]
+    fn test_selective_cleanup_refuses_dangerous_and_unapproved_questionable() {
+        let remnants = vec![
+            RegistryRemnant {
+                hive: "HKEY_CURRENT_USER".into(),
+                subkey: r"Software\NonExistentTestApp".into(),
+                value_name: None,
+                value_data: None,
+                remnant_type: RegistryRemnantType::AppSoftwareKey,
+                confidence: ConfidenceLevel::Questionable,
+                reason: "test".into(),
+            },
+            RegistryRemnant {
+                hive: "HKEY_LOCAL_MACHINE".into(),
+                subkey: r"SOFTWARE\Microsoft".into(),
+                value_name: None,
+                value_data: None,
+                remnant_type: RegistryRemnantType::AppSoftwareKey,
+                confidence: ConfidenceLevel::Dangerous,
+                reason: "test".into(),
+            },
+        ];
+
+        let err = clean_registry_remnants_selective(&remnants, false, None, "test_app").unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn test_force_remove_refuses_store_app_and_missing_location() {
+        let store_app = ApplicationEntry {
+            id: "pkg1".into(),
+            display_name: "Store App".into(),
+            display_version: None,
+            publisher: None,
+            install_location: None,
+            uninstall_string: None,
+            quiet_uninstall_string: None,
+            install_date: None,
+            estimated_size_bytes: None,
+            uninstaller_kind: crate::models::UninstallerKind::StoreApp,
+            is_system_component: false,
+            is_protected: false,
+            registry_location: None,
+        };
+        assert!(force_remove_uninstall_entry(&store_app, None).is_err());
+
+        let mut win32_no_loc = store_app;
+        win32_no_loc.uninstaller_kind = crate::models::UninstallerKind::Nsis;
+        assert!(force_remove_uninstall_entry(&win32_no_loc, None).is_err());
     }
 }

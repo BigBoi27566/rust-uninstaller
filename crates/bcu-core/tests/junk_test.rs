@@ -1,4 +1,4 @@
-use bcu_core::junk::{dir_size_bytes, evaluate_confidence, scan_disk_junk};
+use bcu_core::junk::{dir_size_bytes, evaluate_confidence, find_matching_shortcuts_in, scan_disk_junk};
 use bcu_core::models::ConfidenceLevel;
 use std::fs;
 use std::path::Path;
@@ -67,6 +67,21 @@ fn test_dir_size_bytes_calculates_files_and_skips_missing() {
 
     assert_eq!(dir_size_bytes(&temp_dir), 350);
     assert_eq!(dir_size_bytes(&temp_dir.join("missing")), 0);
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn test_shortcut_matching_in_dir() {
+    let temp_dir = std::env::temp_dir().join("bcu_test_shortcuts");
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).unwrap();
+    fs::write(temp_dir.join("MyApp.lnk"), b"lnk").unwrap();
+    fs::write(temp_dir.join("OtherApp.lnk"), b"lnk").unwrap();
+
+    let found = find_matching_shortcuts_in(&temp_dir, "MyApp");
+    assert_eq!(found.len(), 1);
+    assert!(found[0].path.ends_with("MyApp.lnk"));
 
     let _ = fs::remove_dir_all(&temp_dir);
 }
